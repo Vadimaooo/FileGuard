@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import tkinter as tk
+from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter.font import nametofont
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from app import __version__
-from app.models import AppState
+from app.models import AppState, Baseline
 
 if TYPE_CHECKING:
     from app.controllers.app_controller import AppController
@@ -40,7 +41,7 @@ class MainWindow(tk.Tk):
         self._controller: AppController | None = None
         self.title("FileGuard — Контроль цілісності файлів")
         self.configure(background=BACKGROUND)
-        self.minsize(980, 780)
+        self.minsize(980, 820)
         width = min(1240, self.winfo_screenwidth() - 80)
         height = min(870, self.winfo_screenheight() - 100)
         x = max(0, (self.winfo_screenwidth() - width) // 2)
@@ -51,8 +52,18 @@ class MainWindow(tk.Tk):
         self.include_subfolders = tk.BooleanVar(value=True)
         self.status_text = tk.StringVar()
         self.folder_hint = tk.StringVar(value="Оберіть папку, стан якої потрібно контролювати.")
+        self.baseline_name = tk.StringVar(value="Еталон не завантажено")
+        self.baseline_summary = tk.StringVar(value="Алгоритм: SHA-256")
+        self.baseline_details = tk.StringVar()
+        self.table_title = tk.StringVar(value="Результати перевірки")
+        self.table_footer = tk.StringVar(value="Результатів поки немає")
+        self._rendered_baseline: Baseline | None = None
+        self._table_generation = 0
+        self._progress_running = False
+        self._issues_window: tk.Toplevel | None = None
         self._configure_styles()
         self._build_layout()
+        self.protocol("WM_DELETE_WINDOW", self._request_close)
 
     def _configure_styles(self) -> None:
         """Спільні стилі дають змогу змінювати оформлення в одному місці."""
@@ -144,24 +155,46 @@ class MainWindow(tk.Tk):
         self.folder_entry.grid(row=1, column=0, sticky="ew", padx=(0, 12))
         self.choose_button = ttk.Button(controls, text="Обрати папку", command=self._choose_folder)
         self.choose_button.grid(row=1, column=1, sticky="ew")
-        ttk.Checkbutton(controls, text="Включати вкладені папки", variable=self.include_subfolders,
-                        command=self._change_subfolders).grid(row=2, column=0, sticky="w", pady=(8, 10))
+        self.subfolders_check = ttk.Checkbutton(
+            controls, text="Включати вкладені папки", variable=self.include_subfolders,
+            command=self._change_subfolders,
+        )
+        self.subfolders_check.grid(row=2, column=0, sticky="w", pady=(8, 10))
 
         actions = ttk.Frame(controls, style="Surface.TFrame")
         actions.grid(row=3, column=0, columnspan=2, sticky="ew")
         actions.columnconfigure(0, weight=1)
         baseline = ttk.Frame(actions, style="Surface.TFrame")
         baseline.grid(row=0, column=0, sticky="w", padx=(0, 12))
-        ttk.Label(baseline, text="Еталон не завантажено", style="Surface.TLabel").pack(anchor="w")
-        ttk.Label(baseline, text="Алгоритм: SHA-256", style="SurfaceMuted.TLabel").pack(anchor="w", pady=(3, 0))
-        # Кнопки залишаються неактивними, доки відповідні операції не реалізовано.
-        self.create_baseline_button = ttk.Button(actions, text="Створити еталон", state="disabled")
+        ttk.Label(baseline, textvariable=self.baseline_name, style="Surface.TLabel").pack(anchor="w")
+        ttk.Label(baseline, textvariable=self.baseline_summary, style="SurfaceMuted.TLabel").pack(anchor="w", pady=(3, 0))
+        self.create_baseline_button = ttk.Button(actions, text="Створити еталон", state="disabled",
+                                                 command=self._create_baseline)
         self.create_baseline_button.grid(row=0, column=1, padx=(0, 8))
-        self.load_baseline_button = ttk.Button(actions, text="Завантажити еталон", state="disabled")
+        self.load_baseline_button = ttk.Button(actions, text="Завантажити еталон", command=self._load_baseline)
         self.load_baseline_button.grid(row=0, column=2, padx=(0, 8))
         self.check_button = ttk.Button(actions, text="Перевірити цілісність",
                                        style="Primary.TButton", state="disabled")
         self.check_button.grid(row=0, column=3)
+
+        details = ttk.Frame(controls, style="Surface.TFrame")
+        details.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        details.columnconfigure(0, weight=1)
+        ttk.Label(details, textvariable=self.baseline_details, style="SurfaceMuted.TLabel", wraplength=600).grid(
+            row=0, column=0, sticky="w"
+        )
+        self.issues_button = ttk.Button(details, text="Пропущені шляхи", command=self._show_issues)
+        self.issues_button.grid(row=0, column=1, padx=(8, 0))
+        self.issues_button.grid_remove()
+
+        self.progress_area = ttk.Frame(controls, style="Surface.TFrame")
+        self.progress_area.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.progress_area.columnconfigure(0, weight=1)
+        self.progress_bar = ttk.Progressbar(self.progress_area, mode="indeterminate")
+        self.progress_bar.grid(row=0, column=0, sticky="ew", padx=(0, 12))
+        self.cancel_button = ttk.Button(self.progress_area, text="Скасувати", command=self._cancel_operation)
+        self.cancel_button.grid(row=0, column=1)
+        self.progress_area.grid_remove()
 
         cards = ttk.Frame(self.check_tab)
         cards.grid(row=1, column=0, sticky="ew", pady=12)
@@ -194,7 +227,7 @@ class MainWindow(tk.Tk):
         toolbar = ttk.Frame(results, style="Surface.TFrame")
         toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 12))
         toolbar.columnconfigure(0, weight=1)
-        ttk.Label(toolbar, text="Результати перевірки", style="Heading.TLabel").grid(
+        ttk.Label(toolbar, textvariable=self.table_title, style="Heading.TLabel").grid(
             row=0, column=0, sticky="w"
         )
         self.status_filter = ttk.Combobox(toolbar, values=("Усі статуси",), width=15, state="disabled")
@@ -230,7 +263,7 @@ class MainWindow(tk.Tk):
         ttk.Label(self.empty_state, text="Перевірку ще не виконано", style="Heading.TLabel").pack()
         ttk.Label(self.empty_state, textvariable=self.folder_hint, style="SurfaceMuted.TLabel",
                   wraplength=520, justify="center").pack(pady=(7, 0))
-        ttk.Label(results, text="Результатів поки немає", style="SurfaceMuted.TLabel").grid(
+        ttk.Label(results, textvariable=self.table_footer, style="SurfaceMuted.TLabel").grid(
             row=2, column=0, sticky="w", pady=(10, 0)
         )
 
@@ -250,8 +283,11 @@ class MainWindow(tk.Tk):
         settings_panel.pack(fill="both", expand=True)
         panel = settings_panel.content
         ttk.Label(panel, text="Налаштування перевірки", style="Heading.TLabel").pack(anchor="w")
-        ttk.Checkbutton(panel, text="Включати вкладені папки", variable=self.include_subfolders,
-                        command=self._change_subfolders).pack(anchor="w", pady=(20, 5))
+        self.settings_subfolders_check = ttk.Checkbutton(
+            panel, text="Включати вкладені папки", variable=self.include_subfolders,
+            command=self._change_subfolders,
+        )
+        self.settings_subfolders_check.pack(anchor="w", pady=(20, 5))
         ttk.Label(panel, text="Параметр синхронізовано з вкладкою «Перевірка».",
                   style="SurfaceMuted.TLabel").pack(anchor="w")
         ttk.Label(panel, text="Алгоритм контролю", style="Heading.TLabel").pack(anchor="w", pady=(28, 8))
@@ -270,6 +306,24 @@ class MainWindow(tk.Tk):
         if self._controller is not None:
             self._controller.set_include_subfolders(self.include_subfolders.get())
 
+    def _create_baseline(self) -> None:
+        if self._controller is not None:
+            self._controller.create_baseline()
+
+    def _load_baseline(self) -> None:
+        if self._controller is not None:
+            self._controller.load_baseline()
+
+    def _cancel_operation(self) -> None:
+        if self._controller is not None:
+            self._controller.cancel_operation()
+
+    def _request_close(self) -> None:
+        if self._controller is not None:
+            self._controller.request_close()
+        else:
+            self.destroy()
+
     def ask_directory(self, initial_directory: str | None) -> str:
         """Діалог належить представленню; перевірка шляху належить сервісу."""
         return filedialog.askdirectory(
@@ -282,11 +336,145 @@ class MainWindow(tk.Tk):
     def show_error(self, title: str, message: str) -> None:
         messagebox.showerror(title, message, parent=self)
 
+    def ask_save_baseline(self, directory: Path, filename: str) -> str:
+        return filedialog.asksaveasfilename(
+            parent=self, title="Зберегти еталон", initialdir=str(directory),
+            initialfile=filename, defaultextension=".json", filetypes=(("Еталон JSON", "*.json"),),
+            confirmoverwrite=True,
+        )
+
+    def ask_open_baseline(self, directory: Path) -> str:
+        return filedialog.askopenfilename(
+            parent=self, title="Завантажити еталон", initialdir=str(directory),
+            filetypes=(("Еталон JSON", "*.json"), ("Усі файли", "*.*")),
+        )
+
+    def schedule(self, delay_ms: int, callback: Callable[[], None]) -> None:
+        self.after(delay_ms, callback)
+
+    def close(self) -> None:
+        self.destroy()
+
+    def _show_issues(self) -> None:
+        baseline = self._rendered_baseline
+        if baseline is None or not baseline.issues:
+            return
+        if self._issues_window is not None and self._issues_window.winfo_exists():
+            self._issues_window.destroy()
+        dialog = tk.Toplevel(self)
+        self._issues_window = dialog
+        dialog.title("Шляхи, не включені до еталона")
+        dialog.geometry("820x430")
+        dialog.transient(self)
+        body = ttk.Frame(dialog, padding=18)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="Ці шляхи не охоплені еталоном", style="Subtitle.TLabel").pack(anchor="w")
+        content = tk.Text(body, wrap="word", font=("Segoe UI", 10), background=SURFACE,
+                          foreground=TEXT, relief="flat", padx=12, pady=12)
+        scroll = ttk.Scrollbar(body, command=content.yview)
+        scroll.pack(side="right", fill="y", pady=(12, 0))
+        content.pack(fill="both", expand=True, pady=(12, 0))
+        content.configure(yscrollcommand=scroll.set)
+        # Обмежуємо лише відображення: у JSON зберігається повний список помилок.
+        for issue in baseline.issues[:1000]:
+            content.insert("end", f"{issue.path}\n{issue.message}\n\n")
+        if len(baseline.issues) > 1000:
+            content.insert("end", "Показано перші 1000 записів. Повний список збережено в еталоні.")
+        content.configure(state="disabled")
+
+    @staticmethod
+    def _format_size(size: int) -> str:
+        if size < 1024:
+            return f"{size} Б"
+        if size < 1024 * 1024:
+            return f"{size / 1024:.1f} КіБ"
+        return f"{size / (1024 * 1024):.1f} МіБ"
+
+    def _render_baseline_files(self, baseline: Baseline | None) -> None:
+        if self._issues_window is not None and self._issues_window.winfo_exists():
+            self._issues_window.destroy()
+            self._issues_window = None
+        self._rendered_baseline = baseline
+        self._table_generation += 1
+        generation = self._table_generation
+        rows = self.results_table.get_children()
+        if rows:
+            self.results_table.delete(*rows)
+        if baseline is None:
+            self.empty_state.place(relx=0.5, rely=0.56, anchor="center")
+            self.table_title.set("Результати перевірки")
+            self.table_footer.set("Результатів поки немає")
+            return
+        self.empty_state.place_forget()
+        self.table_title.set("Файли еталона")
+
+        def append_batch(start: int = 0) -> None:
+            if generation != self._table_generation:
+                return
+            end = min(start + 200, len(baseline.files))
+            for item in baseline.files[start:end]:
+                try:
+                    modified = datetime.fromtimestamp(item.modified_ns / 1_000_000_000).strftime("%d.%m.%Y %H:%M")
+                except (OverflowError, OSError, ValueError):
+                    modified = "—"
+                self.results_table.insert("", "end", values=(
+                    item.path, "В еталоні", self._format_size(item.size), modified,
+                ))
+            self.table_footer.set(f"Показано {end} із {len(baseline.files)} файлів еталона · порівняння ще не виконано")
+            if end < len(baseline.files):
+                # Додаємо рядки порціями, щоб великі еталони не блокували вікно.
+                self.after(1, lambda: append_batch(end))
+
+        append_batch()
+
     def render_state(self, state: AppState) -> None:
         """Оновлює віджети зі стану моделі, не змінюючи саму модель."""
         self.folder_text.set(str(state.selected_folder) if state.selected_folder else "Папку ще не обрано")
         self.include_subfolders.set(state.include_subfolders)
         self.status_text.set(state.status_message)
+        enabled = "disabled" if state.busy else "normal"
+        self.choose_button.configure(state=enabled)
+        self.load_baseline_button.configure(state=enabled)
+        self.subfolders_check.configure(state=enabled)
+        self.settings_subfolders_check.configure(state=enabled)
+        self.create_baseline_button.configure(
+            state="normal" if state.selected_folder is not None and not state.busy else "disabled"
+        )
+        self.cancel_button.configure(state="disabled" if state.cancel_requested else "normal")
+        if state.busy:
+            self.progress_area.grid()
+            if not self._progress_running:
+                self.progress_bar.start(15)
+                self._progress_running = True
+        else:
+            self.progress_bar.stop()
+            self._progress_running = False
+            self.progress_area.grid_remove()
+        baseline = state.baseline
+        self.counter_labels["Усього"].configure(text=str(len(baseline.files)) if baseline else "—")
+        if baseline is not None:
+            name = state.baseline_path.name if state.baseline_path else "Еталон"
+            self.baseline_name.set(name if len(name) <= 25 else name[:22] + "…")
+            self.baseline_summary.set(f"SHA-256 · файлів: {len(baseline.files)}")
+            try:
+                created = baseline.created_at.astimezone().strftime("%d.%m.%Y %H:%M:%S")
+            except (OverflowError, OSError, ValueError):
+                created = baseline.created_at.isoformat(timespec="seconds")
+            self.baseline_details.set(
+                f"Створено: {created} · вкладені папки: {'так' if baseline.include_subfolders else 'ні'}"
+                + (" · файл еталона виключено зі сканування" if baseline.excluded_paths else "")
+            )
+        else:
+            self.baseline_name.set("Еталон не завантажено")
+            self.baseline_summary.set("Алгоритм: SHA-256")
+            self.baseline_details.set("")
+        if baseline and baseline.issues:
+            self.issues_button.configure(text=f"Пропущені шляхи: {len(baseline.issues)}")
+            self.issues_button.grid()
+        else:
+            self.issues_button.grid_remove()
+        if baseline is not self._rendered_baseline:
+            self._render_baseline_files(baseline)
         self.folder_hint.set(
             "Папку обрано. Результати з’являться після виконання перевірки."
             if state.selected_folder
