@@ -59,6 +59,10 @@ class MainWindow(tk.Tk):
         self.table_footer = tk.StringVar(value="Результатів поки немає")
         self._rendered_baseline: Baseline | None = None
         self._rendered_check: CheckResult | None = None
+        self._rendered_filter: FileStatus | None = None
+        self._rendered_patterns = None
+        self._visible_files = ()
+        self.empty_title = tk.StringVar(value="Перевірку ще не виконано")
         self._error_count = 0
         self._busy = False
         self._table_generation = 0
@@ -235,8 +239,10 @@ class MainWindow(tk.Tk):
         ttk.Label(toolbar, textvariable=self.table_title, style="Heading.TLabel").grid(
             row=0, column=0, sticky="w"
         )
-        self.status_filter = ttk.Combobox(toolbar, values=("Усі статуси",), width=15, state="disabled")
+        self.status_filter = ttk.Combobox(toolbar, values=("Усі статуси",) + tuple(s.value for s in FileStatus),
+                                          width=15, state="disabled")
         self.status_filter.set("Усі статуси")
+        self.status_filter.bind("<<ComboboxSelected>>", self._change_filter)
         self.status_filter.grid(row=0, column=1, padx=(8, 10))
         self.details_button = ttk.Button(toolbar, text="Відомості", state="disabled", command=self._show_file_details)
         self.details_button.grid(row=0, column=2, padx=(0, 8))
@@ -278,7 +284,7 @@ class MainWindow(tk.Tk):
         # Порожній стан не є рядком результатів і не потрапить до майбутнього експорту.
         self.empty_state = ttk.Frame(table_area, style="Surface.TFrame", padding=16)
         self.empty_state.place(relx=0.5, rely=0.56, anchor="center")
-        ttk.Label(self.empty_state, text="Перевірку ще не виконано", style="Heading.TLabel").pack()
+        ttk.Label(self.empty_state, textvariable=self.empty_title, style="Heading.TLabel").pack()
         ttk.Label(self.empty_state, textvariable=self.folder_hint, style="SurfaceMuted.TLabel",
                   wraplength=520, justify="center").pack(pady=(7, 0))
         ttk.Label(results, textvariable=self.table_footer, style="SurfaceMuted.TLabel").grid(
@@ -312,6 +318,14 @@ class MainWindow(tk.Tk):
         ttk.Label(panel, text="SHA-256", style="Surface.TLabel").pack(anchor="w")
         ttk.Label(panel, text="Еталон зберігатиме цифрові відбитки файлів, а не їхні резервні копії.",
                   style="SurfaceMuted.TLabel", wraplength=700).pack(anchor="w", pady=(7, 0))
+        ttk.Label(panel, text="Виключення для нового еталона", style="Heading.TLabel").pack(anchor="w", pady=(24, 8))
+        ttk.Label(panel, text="Одне правило на рядок. Приклади: *.tmp, .git, __pycache__, cache/, logs/*.log.",
+                  style="SurfaceMuted.TLabel", wraplength=760).pack(anchor="w", pady=(0, 8))
+        self.exclusions_input = tk.Text(panel, height=6, width=65, font=("Consolas", 10),
+                                        relief="solid", borderwidth=1, padx=8, pady=8)
+        self.exclusions_input.pack(anchor="w", fill="x")
+        self.apply_exclusions_button = ttk.Button(panel, text="Застосувати виключення", command=self._apply_exclusions)
+        self.apply_exclusions_button.pack(anchor="w", pady=(10, 0))
 
     def set_controller(self, controller: AppController) -> None:
         self._controller = controller
@@ -335,6 +349,15 @@ class MainWindow(tk.Tk):
     def _check_integrity(self) -> None:
         if self._controller is not None:
             self._controller.check_integrity()
+
+    def _apply_exclusions(self) -> None:
+        if self._controller is not None:
+            patterns = [line.strip() for line in self.exclusions_input.get("1.0", "end").splitlines() if line.strip()]
+            self._controller.set_exclusion_patterns(patterns)
+
+    def _change_filter(self, event=None) -> None:
+        if self._controller is not None:
+            self._controller.set_status_filter(self.status_filter.get())
 
     def _cancel_operation(self) -> None:
         if self._controller is not None:
@@ -426,7 +449,7 @@ class MainWindow(tk.Tk):
         index = int(selection[0].split("-")[-1])
         result = self._rendered_check
         if result is not None:
-            item = result.files[index]
+            item = self._visible_files[index]
             path, status, before, after, message = item.path, item.status.value, item.expected, item.actual, item.message
         elif self._rendered_baseline is not None:
             before = self._rendered_baseline.files[index]
@@ -463,7 +486,7 @@ class MainWindow(tk.Tk):
             return f"{size / 1024:.1f} КіБ"
         return f"{size / (1024 * 1024):.1f} МіБ"
 
-    def _render_files(self, baseline: Baseline | None, result: CheckResult | None) -> None:
+    def _render_files(self, baseline: Baseline | None, result: CheckResult | None, status_filter=None) -> None:
         if self._issues_window is not None and self._issues_window.winfo_exists():
             self._issues_window.destroy()
             self._issues_window = None
@@ -472,19 +495,25 @@ class MainWindow(tk.Tk):
             self._details_window = None
         self._rendered_baseline = baseline
         self._rendered_check = result
+        self._rendered_filter = status_filter
         self._table_generation += 1
         generation = self._table_generation
         rows = self.results_table.get_children()
         if rows:
             self.results_table.delete(*rows)
         if baseline is None:
+            self._visible_files = ()
             self.empty_state.place(relx=0.5, rely=0.56, anchor="center")
             self.table_title.set("Результати перевірки")
             self.table_footer.set("Результатів поки немає")
             return
         self.empty_state.place_forget()
         self.table_title.set("Результати перевірки" if result else "Файли еталона")
-        items = result.files if result else baseline.files
+        items = (tuple(item for item in result.files if status_filter is None or item.status == status_filter)
+                 if result else baseline.files)
+        self._visible_files = items
+        if not items:
+            self.empty_state.place(relx=0.5, rely=0.56, anchor="center")
 
         def append_batch(start: int = 0) -> None:
             if generation != self._table_generation:
@@ -507,7 +536,7 @@ class MainWindow(tk.Tk):
                 ))
             if result is not None:
                 completed = result.completed_at.astimezone().strftime("%d.%m.%Y %H:%M:%S")
-                self.table_footer.set(f"Показано {end} із {len(items)} шляхів · {completed} · {result.duration_seconds:.2f} с")
+                self.table_footer.set(f"Показано {end} із {len(items)} · усього: {len(result.files)} шляхів · {completed} · {result.duration_seconds:.2f} с")
             else:
                 self.table_footer.set(f"Показано {end} із {len(items)} файлів еталона · порівняння ще не виконано")
             if end < len(items):
@@ -527,6 +556,14 @@ class MainWindow(tk.Tk):
         self.load_baseline_button.configure(state=enabled)
         self.subfolders_check.configure(state=enabled)
         self.settings_subfolders_check.configure(state=enabled)
+        self.apply_exclusions_button.configure(state=enabled)
+        self.exclusions_input.configure(state=enabled)
+        if state.exclusion_patterns != self._rendered_patterns:
+            self.exclusions_input.configure(state="normal")
+            self.exclusions_input.delete("1.0", "end")
+            self.exclusions_input.insert("1.0", "\n".join(state.exclusion_patterns))
+            self.exclusions_input.configure(state=enabled)
+            self._rendered_patterns = state.exclusion_patterns
         self.create_baseline_button.configure(
             state="normal" if state.selected_folder is not None and not state.busy else "disabled"
         )
@@ -543,7 +580,10 @@ class MainWindow(tk.Tk):
             self.progress_area.grid_remove()
         baseline = state.baseline
         result = state.check_result
-        if baseline is not self._rendered_baseline or result is not self._rendered_check:
+        self.status_filter.configure(state="readonly" if result is not None and not state.busy else "disabled")
+        self.status_filter.set(state.status_filter.value if state.status_filter is not None else "Усі статуси")
+        if (baseline is not self._rendered_baseline or result is not self._rendered_check
+                or state.status_filter != self._rendered_filter):
             counts = result.counts if result else {}
             self.counter_labels["Усього"].configure(
                 text=str(len(result.files)) if result else str(len(baseline.files)) if baseline else "—"
@@ -552,7 +592,7 @@ class MainWindow(tk.Tk):
                 label = "Помилки" if status == FileStatus.ERROR else status.value
                 self.counter_labels[label].configure(text=str(counts.get(status, 0)) if result else "—")
             self._error_count = counts.get(FileStatus.ERROR, 0)
-            self._render_files(baseline, result)
+            self._render_files(baseline, result, state.status_filter)
         if baseline is not None:
             name = state.baseline_path.name if state.baseline_path else "Еталон"
             self.baseline_name.set(name if len(name) <= 25 else name[:22] + "…")
@@ -563,7 +603,7 @@ class MainWindow(tk.Tk):
                 created = baseline.created_at.isoformat(timespec="seconds")
             self.baseline_details.set(
                 f"Створено: {created} · вкладені папки: {'так' if baseline.include_subfolders else 'ні'}"
-                + (" · файл еталона виключено зі сканування" if baseline.excluded_paths else "")
+                + f" · правил виключення: {len(baseline.exclusion_patterns)}"
             )
         else:
             self.baseline_name.set("Еталон не завантажено")
@@ -580,8 +620,16 @@ class MainWindow(tk.Tk):
         if result is not None:
             self.table_title.set("Попередні результати перевірки" if state.busy else "Результати перевірки")
         self._sync_details_button()
-        self.folder_hint.set(
+        if result is not None and not self._visible_files:
+            self.empty_title.set("Немає результатів за цим фільтром")
+            self.folder_hint.set("Оберіть інший статус або «Усі статуси».")
+        elif baseline is not None and not baseline.files and result is None:
+            self.empty_title.set("Еталон не містить файлів")
+            self.folder_hint.set("Папка порожня або всі її файли виключені правилами.")
+        else:
+            self.empty_title.set("Перевірку ще не виконано")
+            self.folder_hint.set(
             "Папку обрано. Результати з’являться після виконання перевірки."
             if state.selected_folder
             else "Оберіть папку, стан якої потрібно контролювати."
-        )
+            )

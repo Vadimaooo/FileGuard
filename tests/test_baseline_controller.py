@@ -105,7 +105,7 @@ class BaselineControllerTests(unittest.TestCase):
 
     def test_close_during_scan_cancels_before_closing_view(self) -> None:
         class WaitForCancellation(IntegrityService):
-            def create_baseline(self, root, recursive, destination, cancel, on_progress):
+            def create_baseline(self, root, recursive, destination, cancel, on_progress, exclusion_patterns=()):
                 if not cancel.wait(3):
                     raise RuntimeError("Очікування скасування перевищено")
                 raise OperationCancelled()

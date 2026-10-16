@@ -10,6 +10,7 @@ from app.models import AppState, Baseline, CheckResult, FileStatus, ScanProgress
 from app.services.baseline_storage import BaselineStorage
 from app.services.directory_service import DirectoryService
 from app.services.integrity_service import IntegrityService, OperationCancelled, check_cancelled
+from app.services.exclusions import ExclusionRules
 
 
 class AppView(Protocol):
@@ -109,15 +110,33 @@ class AppController:
 
         root = self.state.selected_folder
         recursive = self.state.include_subfolders
+        patterns = self.state.exclusion_patterns
 
         def task() -> tuple[Baseline, Path]:
             baseline = self.integrity_service.create_baseline(
-                root, recursive, destination, self._cancel, self._report_progress
+                root, recursive, destination, self._cancel, self._report_progress, patterns
             )
             self.baseline_storage.save(baseline, destination, self._cancel)
             return baseline, destination
 
         self._start_task(task, "Створення еталона…", "created")
+
+    def set_exclusion_patterns(self, patterns) -> None:
+        if self.state.busy:
+            return
+        try:
+            self.state.exclusion_patterns = ExclusionRules.validate(patterns)
+        except ValueError as error:
+            self.view.show_error("Некоректні виключення", str(error))
+            return
+        self.state.status_message = "Виключення застосовано для нового еталона · чинний еталон зберігає власні правила"
+        self.view.render_state(self.state)
+
+    def set_status_filter(self, status: str) -> None:
+        if self.state.busy:
+            return
+        self.state.status_filter = None if status == "Усі статуси" else FileStatus(status)
+        self.view.render_state(self.state)
 
     def load_baseline(self) -> None:
         if self.state.busy:
@@ -218,6 +237,7 @@ class AppController:
             self.state.baseline_path = path
             self.state.selected_folder = baseline.root_folder
             self.state.include_subfolders = baseline.include_subfolders
+            self.state.exclusion_patterns = baseline.exclusion_patterns
             self.state.check_result = None
             action = "Еталон створено" if kind == "created" else "Еталон завантажено"
             self.state.status_message = f"{action} · файлів: {len(baseline.files)}"

@@ -35,6 +35,7 @@ class Baseline:
     files: tuple[FileSnapshot, ...]
     issues: tuple[ScanIssue, ...] = ()
     excluded_paths: tuple[str, ...] = ()
+    exclusion_patterns: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -87,6 +88,8 @@ class AppState:
 
     selected_folder: Path | None = None
     include_subfolders: bool = True
+    exclusion_patterns: tuple[str, ...] = ()
+    status_filter: FileStatus | None = None
     baseline: Baseline | None = None
     baseline_path: Path | None = None
     check_result: CheckResult | None = None

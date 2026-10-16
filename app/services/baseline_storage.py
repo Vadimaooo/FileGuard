@@ -12,6 +12,7 @@ from typing import Any
 
 from app.models import Baseline, FileSnapshot, ScanIssue
 from app.services.integrity_service import check_cancelled
+from app.services.exclusions import ExclusionRules
 
 
 class BaselineStorage:
@@ -41,12 +42,13 @@ class BaselineStorage:
     def _document(baseline: Baseline) -> dict[str, Any]:
         return {
             "application": "FileGuard",
-            "schema_version": 1,
+            "schema_version": 2,
             "algorithm": "SHA-256",
             "created_at": baseline.created_at.isoformat(),
             "root_folder": str(baseline.root_folder),
             "include_subfolders": baseline.include_subfolders,
             "excluded_paths": list(baseline.excluded_paths),
+            "exclusion_patterns": list(baseline.exclusion_patterns),
             "files": [asdict(item) for item in baseline.files],
             "issues": [asdict(item) for item in baseline.issues],
         }
@@ -107,7 +109,7 @@ class BaselineStorage:
             raise ValueError("Кореневим елементом еталона має бути об'єкт JSON.")
         if document.get("application") != "FileGuard":
             raise ValueError("Цей файл не є еталоном FileGuard.")
-        if type(document.get("schema_version")) is not int or document["schema_version"] != 1:
+        if type(document.get("schema_version")) is not int or document["schema_version"] not in (1, 2):
             raise ValueError("Непідтримувана версія формату еталона.")
         if document.get("algorithm") != "SHA-256":
             raise ValueError("Підтримуються лише еталони SHA-256.")
@@ -134,6 +136,10 @@ class BaselineStorage:
             raise ValueError("Списки файлів, помилок і виключених шляхів мають бути масивами JSON.")
         excluded = tuple(self._relative_path(value) for value in raw_excluded)
         excluded_keys = {value.casefold() for value in excluded}
+        patterns = document.get("exclusion_patterns", []) if document["schema_version"] == 1 else document.get("exclusion_patterns")
+        rules = ExclusionRules(patterns)
+        if document["schema_version"] == 1 and rules.patterns:
+            raise ValueError("Правила виключення потребують формату еталона версії 2.")
         if len(excluded_keys) != len(excluded):
             raise ValueError("Список виключень містить повторювані шляхи.")
         files: list[FileSnapshot] = []
@@ -142,7 +148,7 @@ class BaselineStorage:
             if not isinstance(item, dict):
                 raise ValueError("Запис про файл повинен бути об'єктом JSON.")
             path = self._relative_path(item.get("path"))
-            if path.casefold() in seen or path.casefold() in excluded_keys:
+            if path.casefold() in seen or ExclusionRules.under_path(path, excluded) or rules.matches(path):
                 raise ValueError("Повторюваний шлях або файл одночасно присутній у списку виключень.")
             if not recursive and "/" in path:
                 raise ValueError("Еталон без вкладених папок містить вкладений шлях.")
@@ -157,11 +163,11 @@ class BaselineStorage:
             if not isinstance(item, dict) or not isinstance(item.get("message"), str) or not item["message"]:
                 raise ValueError("Некоректний запис про помилку сканування.")
             path = self._relative_path(item.get("path"))
-            if path.casefold() in seen or path.casefold() in excluded_keys:
+            if path.casefold() in seen or ExclusionRules.under_path(path, excluded) or rules.matches(path):
                 raise ValueError("Список помилок містить повторюваний або суперечливий шлях.")
             issues.append(ScanIssue(path, item["message"]))
             seen.add(path.casefold())
-        return Baseline(root, created, recursive, tuple(files), tuple(issues), excluded)
+        return Baseline(root, created, recursive, tuple(files), tuple(issues), excluded, rules.patterns)
 
     def load(self, source: Path, cancel: Event) -> Baseline:
         check_cancelled(cancel)

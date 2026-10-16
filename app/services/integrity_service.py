@@ -11,6 +11,7 @@ from typing import Callable
 
 from app.models import Baseline, CheckResult, FileCheckResult, FileSnapshot, FileStatus, ScanIssue, ScanProgress
 from app.services.directory_service import DirectoryService
+from app.services.exclusions import ExclusionRules
 
 
 class OperationCancelled(Exception):
@@ -27,6 +28,9 @@ class IntegrityService:
 
     CHUNK_SIZE = 1024 * 1024
 
+    def __init__(self, internal_paths: tuple[Path, ...] = ()) -> None:
+        self.internal_paths = internal_paths
+
     @staticmethod
     def _signature(info: os.stat_result) -> tuple[int, int, int, int]:
         return info.st_size, info.st_mtime_ns, info.st_ino, info.st_dev
@@ -38,18 +42,27 @@ class IntegrityService:
         destination: Path,
         cancel: Event,
         on_progress: Callable[[ScanProgress], None],
+        exclusion_patterns: tuple[str, ...] = (),
     ) -> Baseline:
         root = DirectoryService.validate_folder(str(root))
         excluded = (destination.relative_to(root).as_posix(),) if destination.is_relative_to(root) else ()
-        return self._scan(root, include_subfolders, excluded, cancel, on_progress)
+        for internal in self.internal_paths:
+            internal = internal.resolve()
+            if internal == root:
+                raise ValueError("Оберіть папку з файлами, а не службову папку застосунку.")
+            if internal.is_relative_to(root):
+                excluded += (internal.relative_to(root).as_posix(),)
+        excluded = tuple(dict.fromkeys(excluded))
+        return self._scan(root, include_subfolders, excluded, cancel, on_progress, exclusion_patterns)
 
     def _scan(
         self, root: Path, include_subfolders: bool, excluded: tuple[str, ...],
         cancel: Event, on_progress: Callable[[ScanProgress], None],
+        exclusion_patterns: tuple[str, ...] = (),
     ) -> Baseline:
         """Єдиний алгоритм читання для створення еталона та повторної перевірки."""
         check_cancelled(cancel)
-        excluded_keys = {path.casefold() for path in excluded}
+        rules = ExclusionRules(exclusion_patterns)
         files: list[FileSnapshot] = []
         issues: list[ScanIssue] = []
         pending = [root]
@@ -66,11 +79,13 @@ class IntegrityService:
                         check_cancelled(cancel)
                         path = Path(entry.path)
                         relative = path.relative_to(root).as_posix()
-                        if relative.casefold() in excluded_keys:
+                        if ExclusionRules.under_path(relative, excluded) or rules.matches(relative):
                             continue
                         try:
                             info = entry.stat(follow_symlinks=False)
                             is_directory = stat.S_ISDIR(info.st_mode)
+                            if rules.matches(relative, is_directory):
+                                continue
                             is_junction = is_directory and bool(
                                 getattr(info, "st_file_attributes", 0)
                                 & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
@@ -122,6 +137,7 @@ class IntegrityService:
             files=tuple(sorted(files, key=lambda item: item.path.casefold())),
             issues=tuple(sorted(issues, key=lambda item: item.path.casefold())),
             excluded_paths=excluded,
+            exclusion_patterns=rules.patterns,
         )
 
     @staticmethod
@@ -150,11 +166,15 @@ class IntegrityService:
                 relative = source.relative_to(root).as_posix()
                 if relative.casefold() not in {path.casefold() for path in excluded}:
                     excluded.append(relative)
-        current = self._scan(root, baseline.include_subfolders, tuple(excluded), cancel, on_progress)
-        excluded_keys = {path.casefold() for path in excluded}
-        expected = {item.path.casefold(): item for item in baseline.files if item.path.casefold() not in excluded_keys}
+        current = self._scan(root, baseline.include_subfolders, tuple(excluded), cancel, on_progress,
+                             baseline.exclusion_patterns)
+        rules = ExclusionRules(baseline.exclusion_patterns)
+        excluded_paths = tuple(excluded)
+        def covered(path: str) -> bool:
+            return not ExclusionRules.under_path(path, excluded_paths) and not rules.matches(path)
+        expected = {item.path.casefold(): item for item in baseline.files if covered(item.path)}
         actual = {item.path.casefold(): item for item in current.files}
-        old_issues = {item.path.casefold(): item for item in baseline.issues if item.path.casefold() not in excluded_keys}
+        old_issues = {item.path.casefold(): item for item in baseline.issues if covered(item.path)}
         new_issues = {item.path.casefold(): item for item in current.issues}
         results: list[FileCheckResult] = []
         paths = expected.keys() | actual.keys() | old_issues.keys() | new_issues.keys()

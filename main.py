@@ -6,6 +6,7 @@ from app.services.baseline_storage import BaselineStorage
 from app.services.directory_service import DirectoryService
 from app.services.integrity_service import IntegrityService
 from app.views.main_window import MainWindow
+from pathlib import Path
 
 
 def main() -> None:
@@ -13,7 +14,9 @@ def main() -> None:
     state = AppState()
     window = MainWindow()
     # Залежності поєднуємо лише тут: сервіс нічого не знає про графічне вікно.
-    controller = AppController(state, window, DirectoryService(), IntegrityService(), BaselineStorage())
+    root = Path(__file__).resolve().parent
+    controller = AppController(state, window, DirectoryService(),
+                               IntegrityService((root / "data", root / "reports")), BaselineStorage())
     window.set_controller(controller)
     controller.start()
     window.mainloop()

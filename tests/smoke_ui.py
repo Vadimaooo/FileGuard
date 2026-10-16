@@ -48,6 +48,9 @@ def main() -> None:
             assert controller.select_folder(str(root))
             assert window.folder_text.get() == str(root)
             assert window.create_baseline_button.instate(("!disabled",))
+            window.exclusions_input.insert("1.0", "*.tmp")
+            window.apply_exclusions_button.invoke()
+            assert state.exclusion_patterns == ("*.tmp",)
             controller.set_include_subfolders(False)
             assert window.include_subfolders.get() is False
 
@@ -107,6 +110,20 @@ def main() -> None:
             assert window.counter_labels["Змінено"].cget("text") == "1"
             assert window.counter_labels["Помилки"].cget("text") == "0"
             assert window.table_title.get() == "Результати перевірки"
+            window.status_filter.set(FileStatus.ADDED.value)
+            window.status_filter.event_generate("<<ComboboxSelected>>")
+            window.update()
+            assert len(window.results_table.get_children()) == 1
+            assert window.results_table.item("row-0", "values")[0] == "new.txt"
+            assert window.counter_labels["Усього"].cget("text") == "3"
+            window.status_filter.set(FileStatus.ERROR.value)
+            window.status_filter.event_generate("<<ComboboxSelected>>")
+            window.update()
+            assert not window.results_table.get_children()
+            assert window.empty_title.get() == "Немає результатів за цим фільтром"
+            window.status_filter.set("Усі статуси")
+            window.status_filter.event_generate("<<ComboboxSelected>>")
+            window.update()
             first = window.results_table.get_children()[0]
             assert window.results_table.item(first, "tags")
             window.results_table.selection_set(first)
