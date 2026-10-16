@@ -1,16 +1,26 @@
 """Координація інтерфейсу, стану застосунку та файлових операцій."""
 
 from datetime import datetime
+from dataclasses import dataclass
 from pathlib import Path
 from queue import Empty, Full, Queue, SimpleQueue
 from threading import Event, Thread
 from typing import Callable, Protocol
 
-from app.models import AppState, Baseline, CheckResult, FileStatus, ScanProgress
+from app.models import AppState, Baseline, CheckResult, FileStatus, HistoryEntry, ScanProgress
 from app.services.baseline_storage import BaselineStorage
 from app.services.directory_service import DirectoryService
 from app.services.integrity_service import IntegrityService, OperationCancelled, check_cancelled
 from app.services.exclusions import ExclusionRules
+from app.services.history_storage import HistoryStorage
+from app.services.report_codec import report_text
+
+
+@dataclass(frozen=True)
+class CheckCompletion:
+    result: CheckResult
+    entries: tuple[HistoryEntry, ...] | None = None
+    warning: str = ""
 
 
 class AppView(Protocol):
@@ -30,6 +40,8 @@ class AppView(Protocol):
 
     def close(self) -> None: ...
 
+    def show_saved_result(self, result: CheckResult, text: str) -> None: ...
+
 
 class AppController:
     """Обробляє команди; не створює віджетів і не обчислює хешів."""
@@ -38,12 +50,15 @@ class AppController:
         self, state: AppState, view: AppView, directory_service: DirectoryService,
         integrity_service: IntegrityService | None = None,
         baseline_storage: BaselineStorage | None = None,
+        history_storage: HistoryStorage | None = None,
     ) -> None:
         self.state = state
         self.view = view
         self.directory_service = directory_service
         self.integrity_service = integrity_service or IntegrityService()
         self.baseline_storage = baseline_storage or BaselineStorage()
+        self.history_storage = history_storage
+        self.state.history_available = history_storage is not None
         self._cancel = Event()
         self._progress_queue: Queue[ScanProgress] = Queue(maxsize=1)
         self._result_queue: SimpleQueue[tuple[str, object]] = SimpleQueue()
@@ -54,6 +69,8 @@ class AppController:
     def start(self) -> None:
         """Показати початковий стан застосунку."""
         self.view.render_state(self.state)
+        if self.history_storage is not None:
+            self.refresh_history()
 
     def choose_folder(self) -> None:
         """Отримати вибір із діалогу та передати шлях на перевірку сервісу."""
@@ -158,12 +175,37 @@ class AppController:
         baseline = self.state.baseline
         source = self.state.baseline_path
 
-        def task() -> CheckResult:
-            return self.integrity_service.check_integrity(
+        def task() -> CheckCompletion:
+            result = self.integrity_service.check_integrity(
                 baseline, source, self._cancel, self._report_progress
             )
+            if self.history_storage is None:
+                return CheckCompletion(result)
+            try:
+                self.history_storage.save(result, self._cancel)
+                return CheckCompletion(result, self.history_storage.list_entries())
+            except OperationCancelled:
+                raise
+            except Exception as error:
+                # Збій сховища не скасовує вже отриманий достовірний результат.
+                return CheckCompletion(result, warning=f"Не вдалося оновити історію: {error}")
 
         self._start_task(task, "Перевірка цілісності…", "checked")
+
+    def refresh_history(self) -> None:
+        if self.state.busy or self.history_storage is None:
+            return
+        self._start_task(self.history_storage.list_entries, "Завантаження історії…", "history_list")
+
+    def open_history(self, identifier: str) -> None:
+        if self.state.busy or self.history_storage is None:
+            return
+
+        def task():
+            result = self.history_storage.load(identifier, self._cancel)
+            return result, report_text(result)
+
+        self._start_task(task, "Відкриття збереженої перевірки…", "history_open")
 
     def _report_progress(self, progress: ScanProgress) -> None:
         # Зберігаємо лише найновіше повідомлення, щоб великі папки не переповнили чергу.
@@ -176,7 +218,7 @@ class AppController:
         except Full:
             pass
 
-    def _start_task(self, task: Callable[[], tuple[Baseline, Path] | CheckResult], message: str, kind: str) -> None:
+    def _start_task(self, task: Callable[[], object], message: str, kind: str) -> None:
         self._cancel = Event()
         self._task_kind = kind
         self._progress_queue = Queue(maxsize=1)
@@ -222,15 +264,27 @@ class AppController:
 
         self.state.busy = False
         self.state.cancel_requested = False
+        warning = ""
         if kind == "checked":
-            self.state.check_result = value
-            counts = value.counts
+            self.state.check_result = value.result
+            if value.entries is not None:
+                self.state.history_entries = value.entries
+            warning = value.warning
+            result = value.result
+            counts = result.counts
             changes = sum(counts[status] for status in (FileStatus.CHANGED, FileStatus.ADDED, FileStatus.DELETED))
             action = "Перевірку завершено з помилками" if counts[FileStatus.ERROR] else "Перевірку завершено"
             self.state.status_message = (
                 f"{action} · змін: {changes} · помилок: {counts[FileStatus.ERROR]}"
-                f" · {value.duration_seconds:.2f} с"
+                f" · {result.duration_seconds:.2f} с"
             )
+        elif kind == "history_list":
+            self.state.history_entries = value
+            self.state.status_message = f"Історію оновлено · записів у списку: {len(value)}"
+        elif kind == "history_open":
+            self.state.status_message = "Відкрито збережену перевірку · поточний еталон не змінено"
+            if not self._close_requested:
+                self.view.show_saved_result(*value)
         elif kind in ("created", "loaded"):
             baseline, path = value
             self.state.baseline = baseline
@@ -255,8 +309,12 @@ class AppController:
         if self._close_requested:
             self.view.close()
         elif kind == "error":
-            title = "Не вдалося перевірити цілісність" if self._task_kind == "checked" else "Не вдалося опрацювати еталон"
+            titles = {"checked": "Не вдалося перевірити цілісність", "history_list": "Історія недоступна",
+                      "history_open": "Не вдалося відкрити запис історії"}
+            title = titles.get(self._task_kind, "Не вдалося опрацювати еталон")
             self.view.show_error(title, str(value))
+        elif warning:
+            self.view.show_error("Результат отримано, історія недоступна", warning)
 
     def cancel_operation(self) -> None:
         if self.state.busy:

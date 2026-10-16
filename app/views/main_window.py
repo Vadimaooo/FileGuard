@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Callable
 
 from app import __version__
 from app.models import AppState, Baseline, CheckResult, FileStatus
+from app.views.saved_result_window import SavedResultWindow
 
 if TYPE_CHECKING:
     from app.controllers.app_controller import AppController
@@ -62,6 +63,9 @@ class MainWindow(tk.Tk):
         self._rendered_filter: FileStatus | None = None
         self._rendered_patterns = None
         self._visible_files = ()
+        self._rendered_history = None
+        self._history_available = False
+        self._saved_result_window = None
         self.empty_title = tk.StringVar(value="Перевірку ще не виконано")
         self._error_count = 0
         self._busy = False
@@ -295,12 +299,35 @@ class MainWindow(tk.Tk):
         history_panel = SurfacePanel(self.history_tab, padding=26)
         history_panel.pack(fill="both", expand=True)
         panel = history_panel.content
-        ttk.Label(panel, text="Історія перевірок", style="Heading.TLabel").pack(anchor="w")
-        empty = ttk.Frame(panel, style="Surface.TFrame")
-        empty.pack(expand=True)
-        ttk.Label(empty, text="Історія перевірок порожня", style="Heading.TLabel").pack()
-        ttk.Label(empty, text="Тут відображатимуться результати виконаних перевірок.",
-                  style="SurfaceMuted.TLabel").pack(pady=(8, 0))
+        toolbar = ttk.Frame(panel, style="Surface.TFrame")
+        toolbar.pack(fill="x", pady=(0, 16))
+        ttk.Label(toolbar, text="Історія перевірок", style="Heading.TLabel").pack(side="left")
+        self.history_open_button = ttk.Button(toolbar, text="Відкрити", command=self._open_history, state="disabled")
+        self.history_open_button.pack(side="right")
+        self.history_refresh_button = ttk.Button(toolbar, text="Оновити", command=self._refresh_history)
+        self.history_refresh_button.pack(side="right", padx=(0, 10))
+        area = ttk.Frame(panel, style="Surface.TFrame")
+        area.pack(fill="both", expand=True)
+        area.columnconfigure(0, weight=1)
+        area.rowconfigure(0, weight=1)
+        self.history_table = ttk.Treeview(area, columns=("date", "folder", "total", "changes", "errors", "duration"),
+                                          show="headings", selectmode="browse")
+        for column, label, width in (("date", "Дата", 170), ("folder", "Папка", 380),
+                                     ("total", "Усього", 80), ("changes", "Зміни", 80),
+                                     ("errors", "Помилки", 80), ("duration", "Час, с", 80)):
+            self.history_table.heading(column, text=label)
+            self.history_table.column(column, width=width, minwidth=70)
+        self.history_table.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(area, command=self.history_table.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        horizontal = ttk.Scrollbar(area, orient="horizontal", command=self.history_table.xview)
+        horizontal.grid(row=1, column=0, sticky="ew")
+        self.history_table.configure(yscrollcommand=scrollbar.set, xscrollcommand=horizontal.set)
+        self.history_table.bind("<<TreeviewSelect>>", lambda event: self._sync_history_button())
+        self.history_table.bind("<Double-1>", self._open_history)
+        self.history_table.bind("<Return>", self._open_history)
+        self.history_summary = tk.StringVar(value="Історія перевірок порожня")
+        ttk.Label(panel, textvariable=self.history_summary, style="SurfaceMuted.TLabel").pack(anchor="w", pady=(12, 0))
 
     def _build_settings_tab(self) -> None:
         settings_panel = SurfacePanel(self.settings_tab, padding=26)
@@ -358,6 +385,24 @@ class MainWindow(tk.Tk):
     def _change_filter(self, event=None) -> None:
         if self._controller is not None:
             self._controller.set_status_filter(self.status_filter.get())
+
+    def _refresh_history(self) -> None:
+        if self._controller is not None:
+            self._controller.refresh_history()
+
+    def _open_history(self, event=None) -> None:
+        selection = self.history_table.selection()
+        if selection and self._controller is not None and not self._busy:
+            self._controller.open_history(selection[0])
+
+    def _sync_history_button(self) -> None:
+        self.history_open_button.configure(state="normal" if self.history_table.selection()
+                                            and self._history_available and not self._busy else "disabled")
+
+    def show_saved_result(self, result: CheckResult, text: str) -> None:
+        if self._saved_result_window is not None and self._saved_result_window.winfo_exists():
+            self._saved_result_window.destroy()
+        self._saved_result_window = SavedResultWindow(self, result, text)
 
     def _cancel_operation(self) -> None:
         if self._controller is not None:
@@ -550,6 +595,23 @@ class MainWindow(tk.Tk):
         self.folder_text.set(str(state.selected_folder) if state.selected_folder else "Папку ще не обрано")
         self.include_subfolders.set(state.include_subfolders)
         self._busy = state.busy
+        self._history_available = state.history_available
+        self.history_refresh_button.configure(state="normal" if state.history_available and not state.busy else "disabled")
+        self._sync_history_button()
+        if state.history_entries is not self._rendered_history:
+            self._rendered_history = state.history_entries
+            children = self.history_table.get_children()
+            if children:
+                self.history_table.delete(*children)
+            for entry in state.history_entries:
+                changes = sum(entry.counts.get(s, 0) for s in (FileStatus.CHANGED, FileStatus.ADDED, FileStatus.DELETED))
+                self.history_table.insert("", "end", iid=entry.identifier, values=(
+                    entry.completed_at.astimezone().strftime("%d.%m.%Y %H:%M:%S"), str(entry.root_folder),
+                    sum(entry.counts.values()), changes, entry.counts.get(FileStatus.ERROR, 0),
+                    f"{entry.duration_seconds:.2f}",
+                ))
+            self.history_summary.set(f"Показано {len(state.history_entries)} останніх перевірок (до 200). Повні результати доступні через «Відкрити»."
+                                     if state.history_entries else "Історія перевірок порожня")
         self.status_text.set(state.status_message)
         enabled = "disabled" if state.busy else "normal"
         self.choose_button.configure(state=enabled)

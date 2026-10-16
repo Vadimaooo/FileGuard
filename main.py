@@ -7,6 +7,7 @@ from app.services.directory_service import DirectoryService
 from app.services.integrity_service import IntegrityService
 from app.views.main_window import MainWindow
 from pathlib import Path
+from app.services.history_storage import HistoryStorage
 
 
 def main() -> None:
@@ -16,7 +17,8 @@ def main() -> None:
     # Залежності поєднуємо лише тут: сервіс нічого не знає про графічне вікно.
     root = Path(__file__).resolve().parent
     controller = AppController(state, window, DirectoryService(),
-                               IntegrityService((root / "data", root / "reports")), BaselineStorage())
+                               IntegrityService((root / "data", root / "reports")), BaselineStorage(),
+                               HistoryStorage(root / "data" / "history.sqlite3"))
     window.set_controller(controller)
     controller.start()
     window.mainloop()

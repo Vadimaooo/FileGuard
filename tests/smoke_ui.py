@@ -3,6 +3,7 @@
 import sys
 import tempfile
 import time
+import gc
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -80,6 +81,9 @@ def main() -> None:
             saved = state.baseline
         finally:
             window.destroy()
+            # Звільняємо циклічні посилання старого Tcl-інтерпретатора в головному потоці.
+            del controller, window
+            gc.collect()
 
         # Нове вікно та нова модель імітують повторний запуск застосунку.
         window = MainWindow()
@@ -169,6 +173,8 @@ def main() -> None:
             assert heartbeat and len(window.results_table.get_children()) == 1200
         finally:
             window.destroy()
+            del controller, window
+            gc.collect()
     print("UI smoke: OK (baseline, comparison, counters, colors, details, errors, resizing, incremental table)")
 
 

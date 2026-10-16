@@ -82,6 +82,17 @@ class CheckResult:
         return Counter(item.status for item in self.files)
 
 
+@dataclass(frozen=True)
+class HistoryEntry:
+    """Короткі відомості для списку без завантаження повного звіту."""
+
+    identifier: str
+    completed_at: datetime
+    root_folder: Path
+    duration_seconds: float
+    counts: dict[FileStatus, int]
+
+
 @dataclass
 class AppState:
     """Поточні параметри роботи застосунку в межах одного запуску."""
@@ -90,6 +101,8 @@ class AppState:
     include_subfolders: bool = True
     exclusion_patterns: tuple[str, ...] = ()
     status_filter: FileStatus | None = None
+    history_available: bool = False
+    history_entries: tuple[HistoryEntry, ...] = ()
     baseline: Baseline | None = None
     baseline_path: Path | None = None
     check_result: CheckResult | None = None
