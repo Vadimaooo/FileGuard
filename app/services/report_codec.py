@@ -81,7 +81,7 @@ class ReportCodec:
 
 
 def report_text(result: CheckResult) -> str:
-    """Один текстовий формат для перегляду історії та майбутнього експорту."""
+    """Один текстовий формат для перегляду історії та експорту."""
     counts = result.counts
     lines = ["FileGuard — Звіт про контроль цілісності файлів", "",
              f"Папка: {result.baseline.root_folder}",

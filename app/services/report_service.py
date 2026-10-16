@@ -4,6 +4,7 @@ import csv
 from pathlib import Path
 
 from app.models import CheckResult, FileStatus
+from app.paths import application_directory
 from app.services.atomic_file import atomic_text_file
 from app.services.exclusions import ExclusionRules
 from app.services.integrity_service import check_cancelled
@@ -12,7 +13,7 @@ from app.services.report_codec import report_text
 
 class ReportService:
     def __init__(self, directory: Path | None = None):
-        self.default_directory = directory or Path(__file__).resolve().parents[2] / "reports"
+        self.default_directory = directory or application_directory() / "reports"
 
     @staticmethod
     def safe_cell(value):

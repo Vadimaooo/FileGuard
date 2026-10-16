@@ -11,6 +11,7 @@ from threading import Event
 from typing import Any
 
 from app.models import Baseline, FileSnapshot, ScanIssue
+from app.paths import application_directory
 from app.services.integrity_service import check_cancelled
 from app.services.exclusions import ExclusionRules
 
@@ -23,7 +24,7 @@ class BaselineStorage:
     @property
     def default_directory(self) -> Path:
         # Розташування не залежить від папки, з якої запущено main.py.
-        return Path(__file__).resolve().parents[2] / "data"
+        return application_directory() / "data"
 
     @staticmethod
     def prepare_destination(value: str) -> Path:
