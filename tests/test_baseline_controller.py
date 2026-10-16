@@ -7,7 +7,7 @@ from pathlib import Path
 from threading import get_ident
 
 from app.controllers.app_controller import AppController
-from app.models import AppState
+from app.models import AppState, FileStatus
 from app.services.baseline_storage import BaselineStorage
 from app.services.directory_service import DirectoryService
 from app.services.integrity_service import IntegrityService, OperationCancelled
@@ -125,9 +125,95 @@ class BaselineControllerTests(unittest.TestCase):
         self.controller.create_baseline()
         self.finish()
         self.assertIsNotNone(self.state.baseline)
+        self.controller.check_integrity()
+        self.finish()
+        self.assertIsNotNone(self.state.check_result)
         self.assertTrue(self.controller.select_folder(str(self.directory)))
         self.assertIsNone(self.state.baseline)
         self.assertIsNone(self.state.baseline_path)
+        self.assertIsNone(self.state.check_result)
+
+    def test_check_updates_results_without_modifying_baseline_and_uses_main_thread_for_view(self) -> None:
+        self.view.save_path = str(self.destination)
+        self.controller.create_baseline()
+        self.finish()
+        previous = self.state.baseline
+        saved_json = self.destination.read_bytes()
+        (self.root / "test.txt").write_text("changed", encoding="utf-8")
+        self.controller.check_integrity()
+        self.finish()
+        self.assertEqual(self.state.check_result.counts[FileStatus.CHANGED], 1)
+        self.assertIs(self.state.baseline, previous)
+        self.assertEqual(self.destination.read_bytes(), saved_json)
+        self.assertEqual(set(self.view.thread_ids), {get_ident()})
+
+    def test_check_scope_is_taken_from_baseline_not_new_baseline_setting(self) -> None:
+        (self.root / "folder").mkdir()
+        nested = self.root / "folder" / "nested.txt"
+        nested.write_bytes(b"abc")
+        self.view.save_path = str(self.destination)
+        self.controller.create_baseline()
+        self.finish()
+        nested.write_bytes(b"changed")
+        self.controller.set_include_subfolders(False)
+        self.controller.check_integrity()
+        self.finish()
+        self.assertEqual(self.state.check_result.counts[FileStatus.CHANGED], 1)
+        self.assertTrue(self.state.check_result.baseline.include_subfolders)
+
+    def test_failed_check_keeps_previous_complete_result(self) -> None:
+        self.view.save_path = str(self.destination)
+        self.controller.create_baseline()
+        self.finish()
+        self.controller.check_integrity()
+        self.finish()
+        previous = self.state.check_result
+        self.root.rename(self.directory / "moved")
+        self.controller.check_integrity()
+        self.finish()
+        self.assertIs(self.state.check_result, previous)
+        self.assertEqual(len(self.view.errors), 1)
+
+    def test_cancelled_check_keeps_previous_complete_result(self) -> None:
+        self.view.save_path = str(self.destination)
+        self.controller.create_baseline()
+        self.finish()
+        self.controller.check_integrity()
+        self.finish()
+        previous = self.state.check_result
+
+        class WaitForCancellation(IntegrityService):
+            def check_integrity(self, baseline, source, cancel, on_progress):
+                if not cancel.wait(3):
+                    raise RuntimeError("Очікування скасування перевищено")
+                raise OperationCancelled()
+
+        self.controller.integrity_service = WaitForCancellation()
+        self.controller.check_integrity()
+        self.controller.check_integrity()  # Повторне натискання не створює друге завдання.
+        self.controller.cancel_operation()
+        self.finish()
+        self.assertIs(self.state.check_result, previous)
+        self.assertFalse(self.view.errors)
+        self.assertIn("скасовано", self.state.status_message)
+
+    def test_only_successful_baseline_load_clears_completed_check(self) -> None:
+        self.view.save_path = str(self.destination)
+        self.controller.create_baseline()
+        self.finish()
+        self.controller.check_integrity()
+        self.finish()
+        previous = self.state.check_result
+        broken = self.directory / "broken.json"
+        broken.write_bytes(b"broken")
+        self.view.open_path = str(broken)
+        self.controller.load_baseline()
+        self.finish()
+        self.assertIs(self.state.check_result, previous)
+        self.view.open_path = str(self.destination)
+        self.controller.load_baseline()
+        self.finish()
+        self.assertIsNone(self.state.check_result)
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ from tkinter.font import nametofont
 from typing import TYPE_CHECKING, Callable
 
 from app import __version__
-from app.models import AppState, Baseline
+from app.models import AppState, Baseline, CheckResult, FileStatus
 
 if TYPE_CHECKING:
     from app.controllers.app_controller import AppController
@@ -43,7 +43,7 @@ class MainWindow(tk.Tk):
         self.configure(background=BACKGROUND)
         self.minsize(980, 820)
         width = min(1240, self.winfo_screenwidth() - 80)
-        height = min(870, self.winfo_screenheight() - 100)
+        height = min(920, self.winfo_screenheight() - 100)
         x = max(0, (self.winfo_screenwidth() - width) // 2)
         y = max(0, (self.winfo_screenheight() - height) // 2 - 20)
         self.geometry(f"{width}x{height}+{x}+{y}")
@@ -58,9 +58,13 @@ class MainWindow(tk.Tk):
         self.table_title = tk.StringVar(value="Результати перевірки")
         self.table_footer = tk.StringVar(value="Результатів поки немає")
         self._rendered_baseline: Baseline | None = None
+        self._rendered_check: CheckResult | None = None
+        self._error_count = 0
+        self._busy = False
         self._table_generation = 0
         self._progress_running = False
         self._issues_window: tk.Toplevel | None = None
+        self._details_window: tk.Toplevel | None = None
         self._configure_styles()
         self._build_layout()
         self.protocol("WM_DELETE_WINDOW", self._request_close)
@@ -174,7 +178,7 @@ class MainWindow(tk.Tk):
         self.load_baseline_button = ttk.Button(actions, text="Завантажити еталон", command=self._load_baseline)
         self.load_baseline_button.grid(row=0, column=2, padx=(0, 8))
         self.check_button = ttk.Button(actions, text="Перевірити цілісність",
-                                       style="Primary.TButton", state="disabled")
+                                       style="Primary.TButton", state="disabled", command=self._check_integrity)
         self.check_button.grid(row=0, column=3)
 
         details = ttk.Frame(controls, style="Surface.TFrame")
@@ -204,13 +208,14 @@ class MainWindow(tk.Tk):
             ("Змінено", "#B46A0A"),
             ("Додано", BLUE),
             ("Видалено", "#D23E4F"),
+            ("Помилки", "#7C3BB5"),
         ]
         self.counter_labels: dict[str, ttk.Label] = {}
         for index, (label, color) in enumerate(card_specs):
             cards.columnconfigure(index, weight=1, uniform="counter")
             card_panel = SurfacePanel(cards, padding=10)
             card_panel.grid(row=0, column=index, sticky="nsew",
-                            padx=(0 if index == 0 else 5, 0 if index == 4 else 5))
+                            padx=(0 if index == 0 else 5, 0 if index == len(card_specs) - 1 else 5))
             card = card_panel.content
             tk.Label(card, text=label, background=SURFACE, foreground=MUTED,
                      font=("Segoe UI", 10)).pack(anchor="w")
@@ -233,8 +238,10 @@ class MainWindow(tk.Tk):
         self.status_filter = ttk.Combobox(toolbar, values=("Усі статуси",), width=15, state="disabled")
         self.status_filter.set("Усі статуси")
         self.status_filter.grid(row=0, column=1, padx=(8, 10))
+        self.details_button = ttk.Button(toolbar, text="Відомості", state="disabled", command=self._show_file_details)
+        self.details_button.grid(row=0, column=2, padx=(0, 8))
         self.export_button = ttk.Button(toolbar, text="Зберегти звіт", state="disabled")
-        self.export_button.grid(row=0, column=2)
+        self.export_button.grid(row=0, column=3)
 
         table_area = ttk.Frame(results, style="Surface.TFrame")
         table_area.grid(row=1, column=0, sticky="nsew")
@@ -251,6 +258,17 @@ class MainWindow(tk.Tk):
             self.results_table.heading(column, text=title, anchor="w")
             self.results_table.column(column, width=width, minwidth=minimum, anchor="w")
         self.results_table.grid(row=0, column=0, sticky="nsew")
+        for status, background, foreground in (
+            (FileStatus.UNCHANGED, "#EBF7EF", "#17663B"),
+            (FileStatus.CHANGED, "#FFF4DF", "#8C5207"),
+            (FileStatus.ADDED, "#EAF1FF", "#1759B8"),
+            (FileStatus.DELETED, "#FFF0F1", "#AE263B"),
+            (FileStatus.ERROR, "#F4EAFE", "#7532A7"),
+        ):
+            self.results_table.tag_configure(status.name, background=background, foreground=foreground)
+        self.results_table.bind("<<TreeviewSelect>>", lambda event: self._sync_details_button())
+        self.results_table.bind("<Double-1>", self._show_file_details)
+        self.results_table.bind("<Return>", self._show_file_details)
         vertical = ttk.Scrollbar(table_area, orient="vertical", command=self.results_table.yview)
         vertical.grid(row=0, column=1, sticky="ns")
         horizontal = ttk.Scrollbar(table_area, orient="horizontal", command=self.results_table.xview)
@@ -288,8 +306,8 @@ class MainWindow(tk.Tk):
             command=self._change_subfolders,
         )
         self.settings_subfolders_check.pack(anchor="w", pady=(20, 5))
-        ttk.Label(panel, text="Параметр синхронізовано з вкладкою «Перевірка».",
-                  style="SurfaceMuted.TLabel").pack(anchor="w")
+        ttk.Label(panel, text="Параметр для нового еталона. Перевірка використовує параметри збереженого еталона.",
+                  style="SurfaceMuted.TLabel", wraplength=760).pack(anchor="w")
         ttk.Label(panel, text="Алгоритм контролю", style="Heading.TLabel").pack(anchor="w", pady=(28, 8))
         ttk.Label(panel, text="SHA-256", style="Surface.TLabel").pack(anchor="w")
         ttk.Label(panel, text="Еталон зберігатиме цифрові відбитки файлів, а не їхні резервні копії.",
@@ -313,6 +331,10 @@ class MainWindow(tk.Tk):
     def _load_baseline(self) -> None:
         if self._controller is not None:
             self._controller.load_baseline()
+
+    def _check_integrity(self) -> None:
+        if self._controller is not None:
+            self._controller.check_integrity()
 
     def _cancel_operation(self) -> None:
         if self._controller is not None:
@@ -357,29 +379,80 @@ class MainWindow(tk.Tk):
 
     def _show_issues(self) -> None:
         baseline = self._rendered_baseline
-        if baseline is None or not baseline.issues:
+        result = self._rendered_check
+        if result is not None:
+            issues = [(item.path, item.message) for item in result.files if item.status == FileStatus.ERROR]
+            title = "Помилки перевірки"
+            heading = "Ці шляхи не вдалося достовірно перевірити"
+        else:
+            issues = [(item.path, item.message) for item in baseline.issues] if baseline else []
+            title = "Шляхи, не включені до еталона"
+            heading = "Ці шляхи не охоплені еталоном"
+        if not issues:
             return
         if self._issues_window is not None and self._issues_window.winfo_exists():
             self._issues_window.destroy()
         dialog = tk.Toplevel(self)
         self._issues_window = dialog
-        dialog.title("Шляхи, не включені до еталона")
+        dialog.title(title)
         dialog.geometry("820x430")
         dialog.transient(self)
         body = ttk.Frame(dialog, padding=18)
         body.pack(fill="both", expand=True)
-        ttk.Label(body, text="Ці шляхи не охоплені еталоном", style="Subtitle.TLabel").pack(anchor="w")
+        ttk.Label(body, text=heading, style="Subtitle.TLabel").pack(anchor="w")
         content = tk.Text(body, wrap="word", font=("Segoe UI", 10), background=SURFACE,
                           foreground=TEXT, relief="flat", padx=12, pady=12)
         scroll = ttk.Scrollbar(body, command=content.yview)
         scroll.pack(side="right", fill="y", pady=(12, 0))
         content.pack(fill="both", expand=True, pady=(12, 0))
         content.configure(yscrollcommand=scroll.set)
-        # Обмежуємо лише відображення: у JSON зберігається повний список помилок.
-        for issue in baseline.issues[:1000]:
-            content.insert("end", f"{issue.path}\n{issue.message}\n\n")
-        if len(baseline.issues) > 1000:
-            content.insert("end", "Показано перші 1000 записів. Повний список збережено в еталоні.")
+        # Повний набір зберігається в моделі; вікно обмежене для швидкого відкриття.
+        for path, message in issues[:1000]:
+            content.insert("end", f"{path}\n{message}\n\n")
+        if len(issues) > 1000:
+            location = "в таблиці результатів" if result is not None else "у збереженому еталоні"
+            content.insert("end", f"Показано перші 1000 записів. Повний список доступний {location}.")
+        content.configure(state="disabled")
+
+    def _sync_details_button(self) -> None:
+        self.details_button.configure(
+            state="normal" if self.results_table.selection() and not self._busy else "disabled"
+        )
+
+    def _show_file_details(self, event=None) -> None:
+        selection = self.results_table.selection()
+        if not selection or self._busy:
+            return
+        index = int(selection[0].split("-")[-1])
+        result = self._rendered_check
+        if result is not None:
+            item = result.files[index]
+            path, status, before, after, message = item.path, item.status.value, item.expected, item.actual, item.message
+        elif self._rendered_baseline is not None:
+            before = self._rendered_baseline.files[index]
+            path, status, after, message = before.path, "В еталоні", None, "Порівняння ще не виконано."
+        else:
+            return
+        if self._details_window is not None and self._details_window.winfo_exists():
+            self._details_window.destroy()
+        dialog = tk.Toplevel(self)
+        self._details_window = dialog
+        dialog.title("Відомості про файл")
+        dialog.geometry("840x400")
+        dialog.transient(self)
+        content = tk.Text(dialog, wrap="word", font=("Consolas", 10), background=SURFACE,
+                          foreground=TEXT, relief="flat", padx=18, pady=18)
+        scroll = ttk.Scrollbar(dialog, command=content.yview)
+        scroll.pack(side="right", fill="y")
+        content.pack(fill="both", expand=True)
+        content.configure(yscrollcommand=scroll.set)
+        content.insert("end", f"Шлях: {path}\nСтатус: {status}\n\n{message}\n\n")
+        for label, snapshot in (("Еталон", before), ("Поточний стан", after)):
+            content.insert("end", f"{label}:\n")
+            if snapshot is None:
+                content.insert("end", "  Дані відсутні\n\n")
+            else:
+                content.insert("end", f"  Розмір: {snapshot.size} Б\n  SHA-256: {snapshot.sha256}\n\n")
         content.configure(state="disabled")
 
     @staticmethod
@@ -390,11 +463,15 @@ class MainWindow(tk.Tk):
             return f"{size / 1024:.1f} КіБ"
         return f"{size / (1024 * 1024):.1f} МіБ"
 
-    def _render_baseline_files(self, baseline: Baseline | None) -> None:
+    def _render_files(self, baseline: Baseline | None, result: CheckResult | None) -> None:
         if self._issues_window is not None and self._issues_window.winfo_exists():
             self._issues_window.destroy()
             self._issues_window = None
+        if self._details_window is not None and self._details_window.winfo_exists():
+            self._details_window.destroy()
+            self._details_window = None
         self._rendered_baseline = baseline
+        self._rendered_check = result
         self._table_generation += 1
         generation = self._table_generation
         rows = self.results_table.get_children()
@@ -406,22 +483,34 @@ class MainWindow(tk.Tk):
             self.table_footer.set("Результатів поки немає")
             return
         self.empty_state.place_forget()
-        self.table_title.set("Файли еталона")
+        self.table_title.set("Результати перевірки" if result else "Файли еталона")
+        items = result.files if result else baseline.files
 
         def append_batch(start: int = 0) -> None:
             if generation != self._table_generation:
                 return
-            end = min(start + 200, len(baseline.files))
-            for item in baseline.files[start:end]:
+            end = min(start + 200, len(items))
+            for index in range(start, end):
+                item = items[index]
+                snapshot = item.actual if result else item
+                status = item.status.value if result else "В еталоні"
+                tags = (item.status.name,) if result else ()
                 try:
-                    modified = datetime.fromtimestamp(item.modified_ns / 1_000_000_000).strftime("%d.%m.%Y %H:%M")
+                    modified = (
+                        datetime.fromtimestamp(snapshot.modified_ns / 1_000_000_000).strftime("%d.%m.%Y %H:%M")
+                        if snapshot is not None else "—"
+                    )
                 except (OverflowError, OSError, ValueError):
                     modified = "—"
-                self.results_table.insert("", "end", values=(
-                    item.path, "В еталоні", self._format_size(item.size), modified,
+                self.results_table.insert("", "end", iid=f"row-{index}", tags=tags, values=(
+                    item.path, status, self._format_size(snapshot.size) if snapshot else "—", modified,
                 ))
-            self.table_footer.set(f"Показано {end} із {len(baseline.files)} файлів еталона · порівняння ще не виконано")
-            if end < len(baseline.files):
+            if result is not None:
+                completed = result.completed_at.astimezone().strftime("%d.%m.%Y %H:%M:%S")
+                self.table_footer.set(f"Показано {end} із {len(items)} шляхів · {completed} · {result.duration_seconds:.2f} с")
+            else:
+                self.table_footer.set(f"Показано {end} із {len(items)} файлів еталона · порівняння ще не виконано")
+            if end < len(items):
                 # Додаємо рядки порціями, щоб великі еталони не блокували вікно.
                 self.after(1, lambda: append_batch(end))
 
@@ -431,6 +520,7 @@ class MainWindow(tk.Tk):
         """Оновлює віджети зі стану моделі, не змінюючи саму модель."""
         self.folder_text.set(str(state.selected_folder) if state.selected_folder else "Папку ще не обрано")
         self.include_subfolders.set(state.include_subfolders)
+        self._busy = state.busy
         self.status_text.set(state.status_message)
         enabled = "disabled" if state.busy else "normal"
         self.choose_button.configure(state=enabled)
@@ -440,6 +530,7 @@ class MainWindow(tk.Tk):
         self.create_baseline_button.configure(
             state="normal" if state.selected_folder is not None and not state.busy else "disabled"
         )
+        self.check_button.configure(state="normal" if state.baseline is not None and not state.busy else "disabled")
         self.cancel_button.configure(state="disabled" if state.cancel_requested else "normal")
         if state.busy:
             self.progress_area.grid()
@@ -451,7 +542,17 @@ class MainWindow(tk.Tk):
             self._progress_running = False
             self.progress_area.grid_remove()
         baseline = state.baseline
-        self.counter_labels["Усього"].configure(text=str(len(baseline.files)) if baseline else "—")
+        result = state.check_result
+        if baseline is not self._rendered_baseline or result is not self._rendered_check:
+            counts = result.counts if result else {}
+            self.counter_labels["Усього"].configure(
+                text=str(len(result.files)) if result else str(len(baseline.files)) if baseline else "—"
+            )
+            for status in FileStatus:
+                label = "Помилки" if status == FileStatus.ERROR else status.value
+                self.counter_labels[label].configure(text=str(counts.get(status, 0)) if result else "—")
+            self._error_count = counts.get(FileStatus.ERROR, 0)
+            self._render_files(baseline, result)
         if baseline is not None:
             name = state.baseline_path.name if state.baseline_path else "Еталон"
             self.baseline_name.set(name if len(name) <= 25 else name[:22] + "…")
@@ -468,13 +569,17 @@ class MainWindow(tk.Tk):
             self.baseline_name.set("Еталон не завантажено")
             self.baseline_summary.set("Алгоритм: SHA-256")
             self.baseline_details.set("")
-        if baseline and baseline.issues:
+        if result and self._error_count:
+            self.issues_button.configure(text=f"Помилки перевірки: {self._error_count}")
+            self.issues_button.grid()
+        elif result is None and baseline and baseline.issues:
             self.issues_button.configure(text=f"Пропущені шляхи: {len(baseline.issues)}")
             self.issues_button.grid()
         else:
             self.issues_button.grid_remove()
-        if baseline is not self._rendered_baseline:
-            self._render_baseline_files(baseline)
+        if result is not None:
+            self.table_title.set("Попередні результати перевірки" if state.busy else "Результати перевірки")
+        self._sync_details_button()
         self.folder_hint.set(
             "Папку обрано. Результати з’являться після виконання перевірки."
             if state.selected_folder

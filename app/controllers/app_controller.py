@@ -6,7 +6,7 @@ from queue import Empty, Full, Queue, SimpleQueue
 from threading import Event, Thread
 from typing import Callable, Protocol
 
-from app.models import AppState, Baseline, ScanProgress
+from app.models import AppState, Baseline, CheckResult, FileStatus, ScanProgress
 from app.services.baseline_storage import BaselineStorage
 from app.services.directory_service import DirectoryService
 from app.services.integrity_service import IntegrityService, OperationCancelled, check_cancelled
@@ -48,6 +48,7 @@ class AppController:
         self._result_queue: SimpleQueue[tuple[str, object]] = SimpleQueue()
         self._close_requested = False
         self._worker: Thread | None = None
+        self._task_kind = ""
 
     def start(self) -> None:
         """Показати початковий стан застосунку."""
@@ -77,6 +78,7 @@ class AppController:
         if resolved != self.state.selected_folder:
             self.state.baseline = None
             self.state.baseline_path = None
+        self.state.check_result = None
         self.state.selected_folder = resolved
         self.state.status_message = "Папку обрано · перевірку ще не виконано"
         self.view.render_state(self.state)
@@ -87,6 +89,8 @@ class AppController:
         if self.state.busy:
             return
         self.state.include_subfolders = bool(enabled)
+        if self.state.baseline is not None:
+            self.state.status_message = "Параметр нового еталона змінено · перевірка використовує параметри еталона"
         self.view.render_state(self.state)
 
     def create_baseline(self) -> None:
@@ -128,6 +132,20 @@ class AppController:
 
         self._start_task(task, "Завантаження еталона…", "loaded")
 
+    def check_integrity(self) -> None:
+        """Перевірка використовує охоплення еталона, а не параметри нового знімка."""
+        if self.state.busy or self.state.baseline is None:
+            return
+        baseline = self.state.baseline
+        source = self.state.baseline_path
+
+        def task() -> CheckResult:
+            return self.integrity_service.check_integrity(
+                baseline, source, self._cancel, self._report_progress
+            )
+
+        self._start_task(task, "Перевірка цілісності…", "checked")
+
     def _report_progress(self, progress: ScanProgress) -> None:
         # Зберігаємо лише найновіше повідомлення, щоб великі папки не переповнили чергу.
         try:
@@ -139,8 +157,9 @@ class AppController:
         except Full:
             pass
 
-    def _start_task(self, task: Callable[[], tuple[Baseline, Path]], message: str, kind: str) -> None:
+    def _start_task(self, task: Callable[[], tuple[Baseline, Path] | CheckResult], message: str, kind: str) -> None:
         self._cancel = Event()
+        self._task_kind = kind
         self._progress_queue = Queue(maxsize=1)
         self.state.busy = True
         self.state.cancel_requested = False
@@ -168,8 +187,9 @@ class AppController:
             self.state.progress = self._progress_queue.get_nowait()
             if not self.state.cancel_requested:
                 progress = self.state.progress
+                action = "Перевірка цілісності" if self._task_kind == "checked" else "Створення еталона"
                 self.state.status_message = (
-                    f"Створення еталона · файлів: {progress.processed_files} · "
+                    f"{action} · файлів: {progress.processed_files} · "
                     f"прочитано: {progress.processed_bytes / (1024 * 1024):.1f} МіБ"
                 )
         except Empty:
@@ -183,25 +203,40 @@ class AppController:
 
         self.state.busy = False
         self.state.cancel_requested = False
-        if kind in ("created", "loaded"):
+        if kind == "checked":
+            self.state.check_result = value
+            counts = value.counts
+            changes = sum(counts[status] for status in (FileStatus.CHANGED, FileStatus.ADDED, FileStatus.DELETED))
+            action = "Перевірку завершено з помилками" if counts[FileStatus.ERROR] else "Перевірку завершено"
+            self.state.status_message = (
+                f"{action} · змін: {changes} · помилок: {counts[FileStatus.ERROR]}"
+                f" · {value.duration_seconds:.2f} с"
+            )
+        elif kind in ("created", "loaded"):
             baseline, path = value
             self.state.baseline = baseline
             self.state.baseline_path = path
             self.state.selected_folder = baseline.root_folder
             self.state.include_subfolders = baseline.include_subfolders
+            self.state.check_result = None
             action = "Еталон створено" if kind == "created" else "Еталон завантажено"
             self.state.status_message = f"{action} · файлів: {len(baseline.files)}"
             if baseline.issues:
                 self.state.status_message += f" · пропущено шляхів: {len(baseline.issues)}"
         elif kind == "cancelled":
-            self.state.status_message = "Операцію скасовано · файл еталона не змінено"
+            self.state.status_message = (
+                "Перевірку скасовано · неповні результати не застосовано"
+                if self._task_kind == "checked"
+                else "Операцію скасовано · файл еталона не змінено"
+            )
         else:
             self.state.status_message = "Операцію не завершено · попередній стан збережено"
         self.view.render_state(self.state)
         if self._close_requested:
             self.view.close()
         elif kind == "error":
-            self.view.show_error("Не вдалося опрацювати еталон", str(value))
+            title = "Не вдалося перевірити цілісність" if self._task_kind == "checked" else "Не вдалося опрацювати еталон"
+            self.view.show_error(title, str(value))
 
     def cancel_operation(self) -> None:
         if self.state.busy:

@@ -1,4 +1,4 @@
-"""Створення файлового еталона SHA-256 без залежності від інтерфейсу."""
+"""Сканування SHA-256 та перевірка цілісності без залежності від інтерфейсу."""
 
 import hashlib
 import os
@@ -9,7 +9,7 @@ from threading import Event
 from time import monotonic
 from typing import Callable
 
-from app.models import Baseline, FileSnapshot, ScanIssue, ScanProgress
+from app.models import Baseline, CheckResult, FileCheckResult, FileSnapshot, FileStatus, ScanIssue, ScanProgress
 from app.services.directory_service import DirectoryService
 
 
@@ -40,8 +40,15 @@ class IntegrityService:
         on_progress: Callable[[ScanProgress], None],
     ) -> Baseline:
         root = DirectoryService.validate_folder(str(root))
-        check_cancelled(cancel)
         excluded = (destination.relative_to(root).as_posix(),) if destination.is_relative_to(root) else ()
+        return self._scan(root, include_subfolders, excluded, cancel, on_progress)
+
+    def _scan(
+        self, root: Path, include_subfolders: bool, excluded: tuple[str, ...],
+        cancel: Event, on_progress: Callable[[ScanProgress], None],
+    ) -> Baseline:
+        """Єдиний алгоритм читання для створення еталона та повторної перевірки."""
+        check_cancelled(cancel)
         excluded_keys = {path.casefold() for path in excluded}
         files: list[FileSnapshot] = []
         issues: list[ScanIssue] = []
@@ -97,7 +104,7 @@ class IntegrityService:
                             current = path.stat(follow_symlinks=False)
                             # Не зберігаємо суміш двох станів файлу, який змінювався під час читання.
                             if self._signature(before) != self._signature(after) or self._signature(after) != self._signature(current):
-                                raise ValueError("Файл змінився під час читання. Повторіть створення еталона.")
+                                raise ValueError("Файл змінився під час читання. Повторіть сканування.")
                             files.append(FileSnapshot(relative, digest.hexdigest(), after.st_size, after.st_mtime_ns))
                         except (OSError, ValueError) as error:
                             issues.append(ScanIssue(relative, f"Не вдалося прочитати: {error}"))
@@ -116,3 +123,68 @@ class IntegrityService:
             issues=tuple(sorted(issues, key=lambda item: item.path.casefold())),
             excluded_paths=excluded,
         )
+
+    @staticmethod
+    def _covering_issue(path: str, issues: dict[str, ScanIssue]) -> ScanIssue | None:
+        """Помилка папки поширюється на всі невидимі під час обходу вкладені файли."""
+        candidate = path
+        while True:
+            if candidate in issues:
+                return issues[candidate]
+            if "/" not in candidate:
+                return None
+            candidate = candidate.rsplit("/", 1)[0]
+
+    def check_integrity(
+        self, baseline: Baseline, baseline_path: Path | None,
+        cancel: Event, on_progress: Callable[[ScanProgress], None],
+    ) -> CheckResult:
+        started = monotonic()
+        check_cancelled(cancel)
+        # Недоступний корінь є помилкою операції, а не видаленням усіх його файлів.
+        root = DirectoryService.validate_folder(str(baseline.root_folder))
+        excluded = list(baseline.excluded_paths)
+        if baseline_path is not None:
+            source = baseline_path.absolute()
+            if source.is_relative_to(root):
+                relative = source.relative_to(root).as_posix()
+                if relative.casefold() not in {path.casefold() for path in excluded}:
+                    excluded.append(relative)
+        current = self._scan(root, baseline.include_subfolders, tuple(excluded), cancel, on_progress)
+        excluded_keys = {path.casefold() for path in excluded}
+        expected = {item.path.casefold(): item for item in baseline.files if item.path.casefold() not in excluded_keys}
+        actual = {item.path.casefold(): item for item in current.files}
+        old_issues = {item.path.casefold(): item for item in baseline.issues if item.path.casefold() not in excluded_keys}
+        new_issues = {item.path.casefold(): item for item in current.issues}
+        results: list[FileCheckResult] = []
+        paths = expected.keys() | actual.keys() | old_issues.keys() | new_issues.keys()
+
+        for key in sorted(paths):
+            check_cancelled(cancel)
+            before, after = expected.get(key), actual.get(key)
+            old_issue = self._covering_issue(key, old_issues)
+            new_issue = self._covering_issue(key, new_issues)
+            path = (after.path if after else before.path if before else
+                    new_issues[key].path if key in new_issues else old_issues[key].path)
+            if new_issue is not None and after is None:
+                message = f"Не вдалося перевірити шлях «{new_issue.path}»: {new_issue.message}"
+                results.append(FileCheckResult(path, FileStatus.ERROR, before, after, message))
+            elif old_issue is not None and before is None:
+                # Без початкового хешу не можна назвати відновлений доступ новим файлом.
+                message = f"Еталон не охоплює шлях «{old_issue.path}»: {old_issue.message} Порівняння неможливе."
+                results.append(FileCheckResult(path, FileStatus.ERROR, before, after, message))
+            elif before is None:
+                results.append(FileCheckResult(path, FileStatus.ADDED, actual=after,
+                                               message="Файл відсутній в еталоні."))
+            elif after is None:
+                results.append(FileCheckResult(path, FileStatus.DELETED, expected=before,
+                                               message="Файл з еталона не знайдено під час обходу папки."))
+            elif before.sha256 == after.sha256:
+                results.append(FileCheckResult(path, FileStatus.UNCHANGED, before, after,
+                                               "SHA-256 вмісту збігається з еталоном."))
+            else:
+                results.append(FileCheckResult(path, FileStatus.CHANGED, before, after,
+                                               "SHA-256 вмісту відрізняється від еталона."))
+
+        check_cancelled(cancel)
+        return CheckResult(baseline, datetime.now(timezone.utc), monotonic() - started, tuple(results))

@@ -1,7 +1,9 @@
 """Моделі даних, які не залежать від графічного інтерфейсу."""
 
 from dataclasses import dataclass, field
+from collections import Counter
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 
 
@@ -44,6 +46,41 @@ class ScanProgress:
     current_path: str = ""
 
 
+class FileStatus(str, Enum):
+    """Статус стосується вмісту файлу, а не лише його дати або розміру."""
+
+    UNCHANGED = "Без змін"
+    CHANGED = "Змінено"
+    ADDED = "Додано"
+    DELETED = "Видалено"
+    ERROR = "Помилка"
+
+
+@dataclass(frozen=True)
+class FileCheckResult:
+    """Результат для одного шляху з даними для пояснення в інтерфейсі."""
+
+    path: str
+    status: FileStatus
+    expected: FileSnapshot | None = None
+    actual: FileSnapshot | None = None
+    message: str = ""
+
+
+@dataclass(frozen=True)
+class CheckResult:
+    """Лише завершена перевірка; скасована операція не створює цього результату."""
+
+    baseline: Baseline
+    completed_at: datetime
+    duration_seconds: float
+    files: tuple[FileCheckResult, ...]
+
+    @property
+    def counts(self) -> Counter[FileStatus]:
+        return Counter(item.status for item in self.files)
+
+
 @dataclass
 class AppState:
     """Поточні параметри роботи застосунку в межах одного запуску."""
@@ -52,6 +89,7 @@ class AppState:
     include_subfolders: bool = True
     baseline: Baseline | None = None
     baseline_path: Path | None = None
+    check_result: CheckResult | None = None
     busy: bool = False
     cancel_requested: bool = False
     progress: ScanProgress = field(default_factory=ScanProgress)
