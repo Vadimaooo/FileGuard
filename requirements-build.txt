@@ -1,2 +1,4 @@
-# Потрібно лише для створення Windows-збірки; запуск із Python не потребує пакетів.
-PyInstaller==6.12.0
+# Залежності інтерфейсу та засоби збирання Windows-версії.
+-r requirements.txt
+PyInstaller==6.22.3
+pyinstaller-hooks-contrib==2026.8

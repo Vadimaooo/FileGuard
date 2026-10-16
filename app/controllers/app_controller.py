@@ -189,6 +189,13 @@ class AppController:
         self._settings_dirty = True
         self.view.render_state(self.state)
 
+    def set_glass_enabled(self, enabled: bool) -> None:
+        if self.state.busy:
+            return
+        self.state.glass_enabled = bool(enabled)
+        self._settings_dirty = True
+        self.view.render_state(self.state)
+
     def load_baseline(self) -> None:
         if self.state.busy:
             return
@@ -261,7 +268,8 @@ class AppController:
         if self.state.busy or self.settings_storage is None:
             return
         settings = AppSettings(self.state.selected_folder, self.state.include_subfolders,
-                               self.state.exclusion_patterns, self.state.status_filter, self.view.get_window_size())
+                               self.state.exclusion_patterns, self.state.status_filter, self.view.get_window_size(),
+                               self.state.glass_enabled)
 
         def task():
             self.settings_storage.save(settings, self._cancel)
@@ -291,7 +299,7 @@ class AppController:
         self.view.render_state(self.state)
 
         def work() -> None:
-            # Фоновий потік не звертається ані до tkinter, ані до моделі вікна.
+            # Фоновий потік не звертається ані до віджетів, ані до моделі вікна.
             try:
                 check_cancelled(self._cancel)
                 self._result_queue.put((kind, task()))
@@ -305,7 +313,7 @@ class AppController:
         self.view.schedule(60, self._poll_task)
 
     def _poll_task(self) -> None:
-        """Обробляється тільки циклом tkinter у головному потоці."""
+        """Обробляється тільки циклом подій інтерфейсу в головному потоці."""
         try:
             self.state.progress = self._progress_queue.get_nowait()
             if not self.state.cancel_requested:
@@ -336,6 +344,7 @@ class AppController:
                 self.state.exclusion_patterns = settings.exclusion_patterns
                 self.state.status_filter = settings.status_filter
                 self.state.window_size = settings.window_size
+                self.state.glass_enabled = settings.glass_enabled
                 if settings.window_size is not None:
                     self.view.apply_window_size(settings.window_size)
             if value["entries"] is not None:

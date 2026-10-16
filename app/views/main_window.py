@@ -1,737 +1,554 @@
-"""Головне вікно: лише віджети, діалоги та відображення стану."""
+"""Представлення MVC на Qt Widgets: компонування, діалоги та відображення."""
 
-from __future__ import annotations
-
-import tkinter as tk
-from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
-from tkinter.font import nametofont
-from typing import TYPE_CHECKING, Callable
+
+from PySide6.QtCore import Qt, QSize, QTimer, QSignalBlocker, QDir
+from PySide6.QtGui import QFont, QStandardItem, QStandardItemModel
+from PySide6.QtWidgets import (
+    QAbstractItemView, QApplication, QButtonGroup, QComboBox, QDialog, QFileDialog,
+    QHBoxLayout, QHeaderView, QLabel, QMenu, QMessageBox, QPlainTextEdit, QProgressBar,
+    QPushButton, QScrollArea, QSizePolicy, QStackedWidget, QTableView, QVBoxLayout, QWidget,
+)
 
 from app import __version__
-from app.models import AppState, Baseline, CheckResult, FileStatus
+from app.models import FileStatus
+from app.views.icons import icon
 from app.views.saved_result_window import SavedResultWindow
-
-if TYPE_CHECKING:
-    from app.controllers.app_controller import AppController
-
-
-BACKGROUND = "#F4F7FC"
-SURFACE = "#FFFFFF"
-TEXT = "#17243C"
-MUTED = "#66758F"
-BLUE = "#1769E8"
-BORDER = "#DCE4F0"
+from app.views.table_models import ResultsModel, StatusDelegate, TONES, display_modified, display_size
+from app.views.widgets import Card, DragBar, Switch, WindowFrame, label
+from app.views.windows_effects import apply_glass
 
 
-class SurfacePanel(tk.Frame):
-    """Повторно використовувана секція: зовнішня рамка та білий вміст."""
-
-    def __init__(self, parent: tk.Misc, padding: int = 18) -> None:
-        super().__init__(parent, background=BORDER, borderwidth=0)
-        self.content = ttk.Frame(self, style="Surface.TFrame", padding=padding)
-        self.content.pack(fill="both", expand=True, padx=1, pady=1)
-
-
-class MainWindow(tk.Tk):
-    """Представлення MVC; звертається до логіки тільки через контролер."""
-
-    def __init__(self) -> None:
+class MainWindow(WindowFrame):
+    def __init__(self):
         super().__init__()
-        self._controller: AppController | None = None
-        self.title("FileGuard — Контроль цілісності файлів")
-        self.configure(background=BACKGROUND)
-        self.minsize(980, 820)
-        width = min(1240, self.winfo_screenwidth() - 80)
-        height = min(920, self.winfo_screenheight() - 100)
-        x = max(0, (self.winfo_screenwidth() - width) // 2)
-        y = max(0, (self.winfo_screenheight() - height) // 2 - 20)
-        self.geometry(f"{width}x{height}+{x}+{y}")
-
-        self.folder_text = tk.StringVar(value="Папку ще не обрано")
-        self.include_subfolders = tk.BooleanVar(value=True)
-        self.status_text = tk.StringVar()
-        self.folder_hint = tk.StringVar(value="Оберіть папку, стан якої потрібно контролювати.")
-        self.baseline_name = tk.StringVar(value="Еталон не завантажено")
-        self.baseline_summary = tk.StringVar(value="Алгоритм: SHA-256")
-        self.baseline_details = tk.StringVar()
-        self.table_title = tk.StringVar(value="Результати перевірки")
-        self.table_footer = tk.StringVar(value="Результатів поки немає")
-        self._rendered_baseline: Baseline | None = None
-        self._rendered_check: CheckResult | None = None
-        self._rendered_filter: FileStatus | None = None
-        self._rendered_patterns = None
-        self._visible_files = ()
-        self._rendered_history = None
-        self._history_available = False
-        self._saved_result_window = None
-        self.empty_title = tk.StringVar(value="Перевірку ще не виконано")
-        self._error_count = 0
+        self._controller = None
+        self._allow_close = False
         self._busy = False
-        self._table_generation = 0
-        self._progress_running = False
-        self._issues_window: tk.Toplevel | None = None
-        self._details_window: tk.Toplevel | None = None
-        self._configure_styles()
+        self._rendered = None
+        self._rendered_patterns = None
+        self._rendered_history = None
+        self._result = self._baseline = None
+        self._saved_result_window = None
+        self._detail_windows = []
+        self._glass_requested = None
+        self._counts = {}
+        self.setWindowTitle("FileGuard — Контроль цілісності файлів")
+        self.setWindowIcon(icon("shield", "#1675ff"))
+        self.setMinimumSize(1080, 820)
+        self.resize(1400, 920)
+        QDir.addSearchPath("fgicons", str(Path(__file__).with_name("assets")))
+        self.setStyleSheet(Path(__file__).with_name("theme.qss").read_text(encoding="utf-8"))
         self._build_layout()
-        self.protocol("WM_DELETE_WINDOW", self._request_close)
-
-    def _configure_styles(self) -> None:
-        """Спільні стилі дають змогу змінювати оформлення в одному місці."""
-        # Загальний option_add('*Font') перекрив би розміри заголовків ttk.
-        nametofont("TkDefaultFont", root=self).configure(family="Segoe UI", size=10)
-        style = ttk.Style(self)
-        style.theme_use("clam")
-        style.configure("TFrame", background=BACKGROUND)
-        style.configure("Surface.TFrame", background=SURFACE)
-        style.configure("TLabel", background=BACKGROUND, foreground=TEXT, font=("Segoe UI", 10))
-        style.configure("Surface.TLabel", background=SURFACE)
-        style.configure("Muted.TLabel", foreground=MUTED)
-        style.configure("SurfaceMuted.TLabel", background=SURFACE, foreground=MUTED)
-        style.configure("Title.TLabel", font=("Segoe UI", 23, "bold"))
-        style.configure("Subtitle.TLabel", foreground=MUTED, font=("Segoe UI", 11))
-        style.configure("Heading.TLabel", background=SURFACE, font=("Segoe UI", 12, "bold"))
-        style.configure("TButton", font=("Segoe UI", 10), padding=(15, 9),
-                        background="#F5F8FD", foreground=TEXT, bordercolor=BORDER,
-                        lightcolor="#F5F8FD", darkcolor="#F5F8FD", focusthickness=1,
-                        focuscolor=BLUE)
-        style.map("TButton", background=[("active", "#E9F0FB")],
-                  foreground=[("disabled", "#8995AA")])
-        style.configure("Primary.TButton", background=BLUE, foreground="white",
-                        bordercolor=BLUE, lightcolor=BLUE, darkcolor=BLUE)
-        style.map("Primary.TButton", background=[("disabled", "#A4BFE9"), ("active", "#1057CB")],
-                  foreground=[("disabled", "#FFFFFF")])
-        style.configure("TEntry", padding=9, fieldbackground=SURFACE, bordercolor=BORDER)
-        style.map("TEntry", fieldbackground=[("readonly", "#FAFCFF")],
-                  foreground=[("readonly", TEXT)])
-        style.configure("TCheckbutton", background=SURFACE, foreground=TEXT, padding=(0, 3))
-        style.map("TCheckbutton", background=[("active", SURFACE)])
-        style.configure("TNotebook", background=BACKGROUND, borderwidth=0, tabmargins=(0, 0, 0, 8))
-        style.configure("TNotebook.Tab", padding=(21, 9), background=BACKGROUND,
-                        foreground=MUTED, font=("Segoe UI", 11), borderwidth=0,
-                        lightcolor=BACKGROUND, darkcolor=BACKGROUND)
-        style.map("TNotebook.Tab", background=[("selected", SURFACE)],
-                  foreground=[("selected", BLUE)])
-        style.configure("Treeview", background=SURFACE, fieldbackground=SURFACE,
-                        foreground=TEXT, rowheight=35, borderwidth=0, font=("Segoe UI", 10))
-        style.configure("Treeview.Heading", background="#F1F5FB", foreground=TEXT,
-                        font=("Segoe UI", 10, "bold"), padding=(10, 9), relief="flat")
-        style.map("Treeview", background=[("selected", "#E3EDFE")],
-                  foreground=[("selected", TEXT)])
-        style.configure("TCombobox", padding=7, bordercolor=BORDER)
-
-    def _build_layout(self) -> None:
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(1, weight=1)
-
-        header = ttk.Frame(self, padding=(26, 15, 26, 12))
-        header.grid(row=0, column=0, sticky="ew")
-        ttk.Label(header, text="FileGuard", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(header, text="Контроль цілісності файлів · порівняння зі збереженим еталоном",
-                  style="Subtitle.TLabel").pack(anchor="w", pady=(4, 0))
-
-        self.notebook = ttk.Notebook(self)
-        self.notebook.grid(row=1, column=0, sticky="nsew", padx=22)
-        self.check_tab = ttk.Frame(self.notebook, padding=(0, 4, 0, 12))
-        self.history_tab = ttk.Frame(self.notebook, padding=(0, 4, 0, 12))
-        self.settings_tab = ttk.Frame(self.notebook, padding=(0, 4, 0, 12))
-        self.notebook.add(self.check_tab, text="Перевірка")
-        self.notebook.add(self.history_tab, text="Історія")
-        self.notebook.add(self.settings_tab, text="Налаштування")
-        self._build_check_tab()
-        self._build_history_tab()
-        self._build_settings_tab()
-
-        footer = ttk.Frame(self, padding=(26, 10, 26, 12))
-        footer.grid(row=2, column=0, sticky="ew")
-        footer.columnconfigure(0, weight=1)
-        ttk.Label(footer, textvariable=self.status_text, style="Muted.TLabel").grid(
-            row=0, column=0, sticky="w"
-        )
-        ttk.Label(footer, text=f"FileGuard {__version__}", style="Muted.TLabel").grid(
-            row=0, column=1, sticky="e"
-        )
-
-    def _build_check_tab(self) -> None:
-        self.check_tab.columnconfigure(0, weight=1)
-        self.check_tab.rowconfigure(2, weight=1)
-        controls_panel = SurfacePanel(self.check_tab, padding=14)
-        controls_panel.grid(row=0, column=0, sticky="ew")
-        controls = controls_panel.content
-        controls.columnconfigure(0, weight=1)
-        ttk.Label(controls, text="Папка для перевірки", style="Surface.TLabel").grid(
-            row=0, column=0, sticky="w", pady=(0, 7)
-        )
-        self.folder_entry = ttk.Entry(controls, textvariable=self.folder_text, state="readonly")
-        self.folder_entry.grid(row=1, column=0, sticky="ew", padx=(0, 12))
-        self.choose_button = ttk.Button(controls, text="Обрати папку", command=self._choose_folder)
-        self.choose_button.grid(row=1, column=1, sticky="ew")
-        self.subfolders_check = ttk.Checkbutton(
-            controls, text="Включати вкладені папки", variable=self.include_subfolders,
-            command=self._change_subfolders,
-        )
-        self.subfolders_check.grid(row=2, column=0, sticky="w", pady=(8, 10))
-
-        actions = ttk.Frame(controls, style="Surface.TFrame")
-        actions.grid(row=3, column=0, columnspan=2, sticky="ew")
-        actions.columnconfigure(0, weight=1)
-        baseline = ttk.Frame(actions, style="Surface.TFrame")
-        baseline.grid(row=0, column=0, sticky="w", padx=(0, 12))
-        ttk.Label(baseline, textvariable=self.baseline_name, style="Surface.TLabel").pack(anchor="w")
-        ttk.Label(baseline, textvariable=self.baseline_summary, style="SurfaceMuted.TLabel").pack(anchor="w", pady=(3, 0))
-        self.create_baseline_button = ttk.Button(actions, text="Створити еталон", state="disabled",
-                                                 command=self._create_baseline)
-        self.create_baseline_button.grid(row=0, column=1, padx=(0, 8))
-        self.load_baseline_button = ttk.Button(actions, text="Завантажити еталон", command=self._load_baseline)
-        self.load_baseline_button.grid(row=0, column=2, padx=(0, 8))
-        self.check_button = ttk.Button(actions, text="Перевірити цілісність",
-                                       style="Primary.TButton", state="disabled", command=self._check_integrity)
-        self.check_button.grid(row=0, column=3)
-
-        details = ttk.Frame(controls, style="Surface.TFrame")
-        details.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        details.columnconfigure(0, weight=1)
-        ttk.Label(details, textvariable=self.baseline_details, style="SurfaceMuted.TLabel", wraplength=600).grid(
-            row=0, column=0, sticky="w"
-        )
-        self.issues_button = ttk.Button(details, text="Пропущені шляхи", command=self._show_issues)
-        self.issues_button.grid(row=0, column=1, padx=(8, 0))
-        self.issues_button.grid_remove()
-
-        self.progress_area = ttk.Frame(controls, style="Surface.TFrame")
-        self.progress_area.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        self.progress_area.columnconfigure(0, weight=1)
-        self.progress_bar = ttk.Progressbar(self.progress_area, mode="indeterminate")
-        self.progress_bar.grid(row=0, column=0, sticky="ew", padx=(0, 12))
-        self.cancel_button = ttk.Button(self.progress_area, text="Скасувати", command=self._cancel_operation)
-        self.cancel_button.grid(row=0, column=1)
-        self.progress_area.grid_remove()
-
-        cards = ttk.Frame(self.check_tab)
-        cards.grid(row=1, column=0, sticky="ew", pady=12)
-        card_specs = [
-            ("Усього", "#526A91"),
-            ("Без змін", "#16854B"),
-            ("Змінено", "#B46A0A"),
-            ("Додано", BLUE),
-            ("Видалено", "#D23E4F"),
-            ("Помилки", "#7C3BB5"),
-        ]
-        self.counter_labels: dict[str, ttk.Label] = {}
-        for index, (label, color) in enumerate(card_specs):
-            cards.columnconfigure(index, weight=1, uniform="counter")
-            card_panel = SurfacePanel(cards, padding=10)
-            card_panel.grid(row=0, column=index, sticky="nsew",
-                            padx=(0 if index == 0 else 5, 0 if index == len(card_specs) - 1 else 5))
-            card = card_panel.content
-            tk.Label(card, text=label, background=SURFACE, foreground=MUTED,
-                     font=("Segoe UI", 10)).pack(anchor="w")
-            value = ttk.Label(card, text="—", background=SURFACE, foreground=color,
-                              font=("Segoe UI", 23, "bold"))
-            value.pack(anchor="w", pady=(2, 0))
-            self.counter_labels[label] = value
-
-        results_panel = SurfacePanel(self.check_tab, padding=14)
-        results_panel.grid(row=2, column=0, sticky="nsew")
-        results = results_panel.content
-        results.columnconfigure(0, weight=1)
-        results.rowconfigure(1, weight=1)
-        toolbar = ttk.Frame(results, style="Surface.TFrame")
-        toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 12))
-        toolbar.columnconfigure(0, weight=1)
-        ttk.Label(toolbar, textvariable=self.table_title, style="Heading.TLabel").grid(
-            row=0, column=0, sticky="w"
-        )
-        self.status_filter = ttk.Combobox(toolbar, values=("Усі статуси",) + tuple(s.value for s in FileStatus),
-                                          width=15, state="disabled")
-        self.status_filter.set("Усі статуси")
-        self.status_filter.bind("<<ComboboxSelected>>", self._change_filter)
-        self.status_filter.grid(row=0, column=1, padx=(8, 10))
-        self.details_button = ttk.Button(toolbar, text="Відомості", state="disabled", command=self._show_file_details)
-        self.details_button.grid(row=0, column=2, padx=(0, 8))
-        self.export_button = ttk.Menubutton(toolbar, text="Зберегти звіт", state="disabled")
-        self.export_menu = tk.Menu(self.export_button, tearoff=False)
-        self.export_menu.add_command(label="Текстовий звіт (.txt)", command=lambda: self._export_report("txt"))
-        self.export_menu.add_command(label="Таблиця CSV (.csv)", command=lambda: self._export_report("csv"))
-        self.export_button.configure(menu=self.export_menu)
-        self.export_button.grid(row=0, column=3)
-
-        table_area = ttk.Frame(results, style="Surface.TFrame")
-        table_area.grid(row=1, column=0, sticky="nsew")
-        table_area.columnconfigure(0, weight=1)
-        table_area.rowconfigure(0, weight=1)
-        self.results_table = ttk.Treeview(table_area, columns=("file", "status", "size", "modified"),
-                                          show="headings", height=4, selectmode="browse")
-        for column, title, width, minimum in [
-            ("file", "Файл", 430, 200),
-            ("status", "Статус", 170, 120),
-            ("size", "Розмір", 110, 90),
-            ("modified", "Остання зміна", 200, 160),
-        ]:
-            self.results_table.heading(column, text=title, anchor="w")
-            self.results_table.column(column, width=width, minwidth=minimum, anchor="w")
-        self.results_table.grid(row=0, column=0, sticky="nsew")
-        for status, background, foreground in (
-            (FileStatus.UNCHANGED, "#EBF7EF", "#17663B"),
-            (FileStatus.CHANGED, "#FFF4DF", "#8C5207"),
-            (FileStatus.ADDED, "#EAF1FF", "#1759B8"),
-            (FileStatus.DELETED, "#FFF0F1", "#AE263B"),
-            (FileStatus.ERROR, "#F4EAFE", "#7532A7"),
-        ):
-            self.results_table.tag_configure(status.name, background=background, foreground=foreground)
-        self.results_table.bind("<<TreeviewSelect>>", lambda event: self._sync_details_button())
-        self.results_table.bind("<Double-1>", self._show_file_details)
-        self.results_table.bind("<Return>", self._show_file_details)
-        vertical = ttk.Scrollbar(table_area, orient="vertical", command=self.results_table.yview)
-        vertical.grid(row=0, column=1, sticky="ns")
-        horizontal = ttk.Scrollbar(table_area, orient="horizontal", command=self.results_table.xview)
-        horizontal.grid(row=1, column=0, sticky="ew")
-        self.results_table.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
-
-        # Порожній стан не є рядком результатів і не потрапить до майбутнього експорту.
-        self.empty_state = ttk.Frame(table_area, style="Surface.TFrame", padding=16)
-        self.empty_state.place(relx=0.5, rely=0.56, anchor="center")
-        ttk.Label(self.empty_state, textvariable=self.empty_title, style="Heading.TLabel").pack()
-        ttk.Label(self.empty_state, textvariable=self.folder_hint, style="SurfaceMuted.TLabel",
-                  wraplength=520, justify="center").pack(pady=(7, 0))
-        ttk.Label(results, textvariable=self.table_footer, style="SurfaceMuted.TLabel").grid(
-            row=2, column=0, sticky="w", pady=(10, 0)
-        )
-
-    def _build_history_tab(self) -> None:
-        history_panel = SurfacePanel(self.history_tab, padding=26)
-        history_panel.pack(fill="both", expand=True)
-        panel = history_panel.content
-        toolbar = ttk.Frame(panel, style="Surface.TFrame")
-        toolbar.pack(fill="x", pady=(0, 16))
-        ttk.Label(toolbar, text="Історія перевірок", style="Heading.TLabel").pack(side="left")
-        self.history_open_button = ttk.Button(toolbar, text="Відкрити", command=self._open_history, state="disabled")
-        self.history_open_button.pack(side="right")
-        self.history_refresh_button = ttk.Button(toolbar, text="Оновити", command=self._refresh_history)
-        self.history_refresh_button.pack(side="right", padx=(0, 10))
-        area = ttk.Frame(panel, style="Surface.TFrame")
-        area.pack(fill="both", expand=True)
-        area.columnconfigure(0, weight=1)
-        area.rowconfigure(0, weight=1)
-        self.history_table = ttk.Treeview(area, columns=("date", "folder", "total", "changes", "errors", "duration"),
-                                          show="headings", selectmode="browse")
-        for column, label, width in (("date", "Дата", 170), ("folder", "Папка", 380),
-                                     ("total", "Усього", 80), ("changes", "Зміни", 80),
-                                     ("errors", "Помилки", 80), ("duration", "Час, с", 80)):
-            self.history_table.heading(column, text=label)
-            self.history_table.column(column, width=width, minwidth=70)
-        self.history_table.grid(row=0, column=0, sticky="nsew")
-        scrollbar = ttk.Scrollbar(area, command=self.history_table.yview)
-        scrollbar.grid(row=0, column=1, sticky="ns")
-        horizontal = ttk.Scrollbar(area, orient="horizontal", command=self.history_table.xview)
-        horizontal.grid(row=1, column=0, sticky="ew")
-        self.history_table.configure(yscrollcommand=scrollbar.set, xscrollcommand=horizontal.set)
-        self.history_table.bind("<<TreeviewSelect>>", lambda event: self._sync_history_button())
-        self.history_table.bind("<Double-1>", self._open_history)
-        self.history_table.bind("<Return>", self._open_history)
-        self.history_summary = tk.StringVar(value="Історія перевірок порожня")
-        ttk.Label(panel, textvariable=self.history_summary, style="SurfaceMuted.TLabel").pack(anchor="w", pady=(12, 0))
-
-    def _build_settings_tab(self) -> None:
-        settings_panel = SurfacePanel(self.settings_tab, padding=26)
-        settings_panel.pack(fill="both", expand=True)
-        panel = settings_panel.content
-        ttk.Label(panel, text="Налаштування перевірки", style="Heading.TLabel").pack(anchor="w")
-        self.settings_subfolders_check = ttk.Checkbutton(
-            panel, text="Включати вкладені папки", variable=self.include_subfolders,
-            command=self._change_subfolders,
-        )
-        self.settings_subfolders_check.pack(anchor="w", pady=(20, 5))
-        ttk.Label(panel, text="Параметр для нового еталона. Перевірка використовує параметри збереженого еталона.",
-                  style="SurfaceMuted.TLabel", wraplength=760).pack(anchor="w")
-        ttk.Label(panel, text="Алгоритм контролю", style="Heading.TLabel").pack(anchor="w", pady=(28, 8))
-        ttk.Label(panel, text="SHA-256", style="Surface.TLabel").pack(anchor="w")
-        ttk.Label(panel, text="Еталон зберігатиме цифрові відбитки файлів, а не їхні резервні копії.",
-                  style="SurfaceMuted.TLabel", wraplength=700).pack(anchor="w", pady=(7, 0))
-        ttk.Label(panel, text="Виключення для нового еталона", style="Heading.TLabel").pack(anchor="w", pady=(24, 8))
-        ttk.Label(panel, text="Одне правило на рядок. Приклади: *.tmp, .git, __pycache__, cache/, logs/*.log.",
-                  style="SurfaceMuted.TLabel", wraplength=760).pack(anchor="w", pady=(0, 8))
-        self.exclusions_input = tk.Text(panel, height=6, width=65, font=("Consolas", 10),
-                                        relief="solid", borderwidth=1, padx=8, pady=8)
-        self.exclusions_input.pack(anchor="w", fill="x")
-        self.apply_exclusions_button = ttk.Button(panel, text="Застосувати виключення", command=self._apply_exclusions)
-        self.apply_exclusions_button.pack(anchor="w", pady=(10, 0))
-        self.save_settings_button = ttk.Button(panel, text="Зберегти налаштування", command=self._save_settings)
-        self.save_settings_button.pack(anchor="w", pady=(16, 0))
-        ttk.Label(panel, text="Застосовані параметри також зберігаються під час закриття програми.",
-                  style="SurfaceMuted.TLabel").pack(anchor="w", pady=(8, 0))
-
-    def set_controller(self, controller: AppController) -> None:
-        self._controller = controller
-
-    def _choose_folder(self) -> None:
-        if self._controller is not None:
-            self._controller.choose_folder()
-
-    def _change_subfolders(self) -> None:
-        if self._controller is not None:
-            self._controller.set_include_subfolders(self.include_subfolders.get())
-
-    def _create_baseline(self) -> None:
-        if self._controller is not None:
-            self._controller.create_baseline()
-
-    def _load_baseline(self) -> None:
-        if self._controller is not None:
-            self._controller.load_baseline()
-
-    def _check_integrity(self) -> None:
-        if self._controller is not None:
-            self._controller.check_integrity()
-
-    def _apply_exclusions(self) -> None:
-        if self._controller is not None:
-            patterns = [line.strip() for line in self.exclusions_input.get("1.0", "end").splitlines() if line.strip()]
-            self._controller.set_exclusion_patterns(patterns)
-
-    def _change_filter(self, event=None) -> None:
-        if self._controller is not None:
-            self._controller.set_status_filter(self.status_filter.get())
-
-    def _save_settings(self):
-        if self._controller is not None:
-            self._controller.save_settings()
-
-    def get_window_size(self):
-        return max(980, self.winfo_width()), max(820, self.winfo_height())
-
-    def apply_window_size(self, size):
-        width = max(980, min(size[0], self.winfo_screenwidth() - 80))
-        height = max(820, min(size[1], self.winfo_screenheight() - 100))
-        x = max(0, (self.winfo_screenwidth() - width) // 2)
-        y = max(0, (self.winfo_screenheight() - height) // 2 - 20)
-        self.geometry(f"{width}x{height}+{x}+{y}")
-
-    def _refresh_history(self) -> None:
-        if self._controller is not None:
-            self._controller.refresh_history()
-
-    def _open_history(self, event=None) -> None:
-        selection = self.history_table.selection()
-        if selection and self._controller is not None and not self._busy:
-            self._controller.open_history(selection[0])
-
-    def _sync_history_button(self) -> None:
-        self.history_open_button.configure(state="normal" if self.history_table.selection()
-                                            and self._history_available and not self._busy else "disabled")
-
-    def show_saved_result(self, result: CheckResult, text: str) -> None:
-        if self._saved_result_window is not None and self._saved_result_window.winfo_exists():
-            self._saved_result_window.destroy()
-        self._saved_result_window = SavedResultWindow(self, result, text, self._export_saved_report)
-
-    def _export_report(self, extension):
-        if self._controller is not None:
-            self._controller.export_result(extension=extension)
-
-    def _export_saved_report(self, result, extension):
-        if self._controller is not None:
-            self._controller.export_result(result, extension)
-
-    def _cancel_operation(self) -> None:
-        if self._controller is not None:
-            self._controller.cancel_operation()
-
-    def _request_close(self) -> None:
-        if self._controller is not None:
-            self._controller.request_close()
-        else:
-            self.destroy()
-
-    def ask_directory(self, initial_directory: str | None) -> str:
-        """Діалог належить представленню; перевірка шляху належить сервісу."""
-        return filedialog.askdirectory(
-            parent=self,
-            title="Оберіть папку для контролю цілісності",
-            initialdir=initial_directory or str(Path.home()),
-            mustexist=True,
-        )
-
-    def show_error(self, title: str, message: str) -> None:
-        messagebox.showerror(title, message, parent=self)
-
-    def ask_save_baseline(self, directory: Path, filename: str) -> str:
-        return filedialog.asksaveasfilename(
-            parent=self, title="Зберегти еталон", initialdir=str(directory),
-            initialfile=filename, defaultextension=".json", filetypes=(("Еталон JSON", "*.json"),),
-            confirmoverwrite=True,
-        )
-
-    def ask_open_baseline(self, directory: Path) -> str:
-        return filedialog.askopenfilename(
-            parent=self, title="Завантажити еталон", initialdir=str(directory),
-            filetypes=(("Еталон JSON", "*.json"), ("Усі файли", "*.*")),
-        )
-
-    def ask_save_report(self, directory: Path, filename: str, extension: str) -> str:
-        label = "Текстовий звіт" if extension == "txt" else "Таблиця CSV"
-        return filedialog.asksaveasfilename(parent=self, title="Зберегти звіт", initialdir=str(directory),
-                                          initialfile=filename, defaultextension="." + extension,
-                                          filetypes=((label, "*." + extension),), confirmoverwrite=True)
-
-    def schedule(self, delay_ms: int, callback: Callable[[], None]) -> None:
-        self.after(delay_ms, callback)
-
-    def close(self) -> None:
-        self.destroy()
-
-    def _show_issues(self) -> None:
-        baseline = self._rendered_baseline
-        result = self._rendered_check
-        if result is not None:
-            issues = [(item.path, item.message) for item in result.files if item.status == FileStatus.ERROR]
-            title = "Помилки перевірки"
-            heading = "Ці шляхи не вдалося достовірно перевірити"
-        else:
-            issues = [(item.path, item.message) for item in baseline.issues] if baseline else []
-            title = "Шляхи, не включені до еталона"
-            heading = "Ці шляхи не охоплені еталоном"
-        if not issues:
-            return
-        if self._issues_window is not None and self._issues_window.winfo_exists():
-            self._issues_window.destroy()
-        dialog = tk.Toplevel(self)
-        self._issues_window = dialog
-        dialog.title(title)
-        dialog.geometry("820x430")
-        dialog.transient(self)
-        body = ttk.Frame(dialog, padding=18)
-        body.pack(fill="both", expand=True)
-        ttk.Label(body, text=heading, style="Subtitle.TLabel").pack(anchor="w")
-        content = tk.Text(body, wrap="word", font=("Segoe UI", 10), background=SURFACE,
-                          foreground=TEXT, relief="flat", padx=12, pady=12)
-        scroll = ttk.Scrollbar(body, command=content.yview)
-        scroll.pack(side="right", fill="y", pady=(12, 0))
-        content.pack(fill="both", expand=True, pady=(12, 0))
-        content.configure(yscrollcommand=scroll.set)
-        # Повний набір зберігається в моделі; вікно обмежене для швидкого відкриття.
-        for path, message in issues[:1000]:
-            content.insert("end", f"{path}\n{message}\n\n")
-        if len(issues) > 1000:
-            location = "в таблиці результатів" if result is not None else "у збереженому еталоні"
-            content.insert("end", f"Показано перші 1000 записів. Повний список доступний {location}.")
-        content.configure(state="disabled")
-
-    def _sync_details_button(self) -> None:
-        self.details_button.configure(
-            state="normal" if self.results_table.selection() and not self._busy else "disabled"
-        )
-
-    def _show_file_details(self, event=None) -> None:
-        selection = self.results_table.selection()
-        if not selection or self._busy:
-            return
-        index = int(selection[0].split("-")[-1])
-        result = self._rendered_check
-        if result is not None:
-            item = self._visible_files[index]
-            path, status, before, after, message = item.path, item.status.value, item.expected, item.actual, item.message
-        elif self._rendered_baseline is not None:
-            before = self._rendered_baseline.files[index]
-            path, status, after, message = before.path, "В еталоні", None, "Порівняння ще не виконано."
-        else:
-            return
-        if self._details_window is not None and self._details_window.winfo_exists():
-            self._details_window.destroy()
-        dialog = tk.Toplevel(self)
-        self._details_window = dialog
-        dialog.title("Відомості про файл")
-        dialog.geometry("840x400")
-        dialog.transient(self)
-        content = tk.Text(dialog, wrap="word", font=("Consolas", 10), background=SURFACE,
-                          foreground=TEXT, relief="flat", padx=18, pady=18)
-        scroll = ttk.Scrollbar(dialog, command=content.yview)
-        scroll.pack(side="right", fill="y")
-        content.pack(fill="both", expand=True)
-        content.configure(yscrollcommand=scroll.set)
-        content.insert("end", f"Шлях: {path}\nСтатус: {status}\n\n{message}\n\n")
-        for label, snapshot in (("Еталон", before), ("Поточний стан", after)):
-            content.insert("end", f"{label}:\n")
-            if snapshot is None:
-                content.insert("end", "  Дані відсутні\n\n")
-            else:
-                content.insert("end", f"  Розмір: {snapshot.size} Б\n  SHA-256: {snapshot.sha256}\n\n")
-        content.configure(state="disabled")
+        self.apply_window_size((1400, 920))
 
     @staticmethod
-    def _format_size(size: int) -> str:
-        if size < 1024:
-            return f"{size} Б"
-        if size < 1024 * 1024:
-            return f"{size / 1024:.1f} КіБ"
-        return f"{size / (1024 * 1024):.1f} МіБ"
+    def button(text, callback, primary=False, symbol=None):
+        button = QPushButton(text)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        if primary:
+            button.setObjectName("Primary")
+        if symbol:
+            button.setIcon(icon(symbol))
+        button.clicked.connect(callback)
+        return button
 
-    def _render_files(self, baseline: Baseline | None, result: CheckResult | None, status_filter=None) -> None:
-        if self._issues_window is not None and self._issues_window.winfo_exists():
-            self._issues_window.destroy()
-            self._issues_window = None
-        if self._details_window is not None and self._details_window.winfo_exists():
-            self._details_window.destroy()
-            self._details_window = None
-        self._rendered_baseline = baseline
-        self._rendered_check = result
-        self._rendered_filter = status_filter
-        self._table_generation += 1
-        generation = self._table_generation
-        rows = self.results_table.get_children()
-        if rows:
-            self.results_table.delete(*rows)
-        if baseline is None:
-            self._visible_files = ()
-            self.empty_state.place(relx=0.5, rely=0.56, anchor="center")
-            self.table_title.set("Результати перевірки")
-            self.table_footer.set("Результатів поки немає")
-            return
-        self.empty_state.place_forget()
-        self.table_title.set("Результати перевірки" if result else "Файли еталона")
-        items = (tuple(item for item in result.files if status_filter is None or item.status == status_filter)
-                 if result else baseline.files)
-        self._visible_files = items
-        if not items:
-            self.empty_state.place(relx=0.5, rely=0.56, anchor="center")
+    def _build_layout(self):
+        root = QHBoxLayout(self)
+        root.setContentsMargins(1, 1, 1, 1)
+        root.setSpacing(0)
+        self.sidebar = Card(name="Sidebar", margins=20)
+        self.sidebar.setFixedWidth(226)
+        brand = QHBoxLayout()
+        shield = QLabel()
+        shield.setPixmap(icon("shield", "#1675ff", 38).pixmap(38, 38))
+        brand.addWidget(shield)
+        brand.addWidget(label("FileGuard", "Brand"))
+        brand.addStretch()
+        self.sidebar.box.addLayout(brand)
+        self.sidebar.box.addSpacing(25)
+        self.pages = QStackedWidget()
+        self.navigation = []
+        self.nav_group = QButtonGroup(self)
+        for index, (text, symbol) in enumerate((("Перевірка", "search"), ("Історія", "clock"),
+                                                ("Налаштування", "settings"))):
+            button = self.button(text, lambda checked=False, page=index: self.pages.setCurrentIndex(page), symbol=symbol)
+            button.setObjectName("Navigation")
+            button.setIconSize(QSize(23, 23))
+            button.setCheckable(True)
+            self.nav_group.addButton(button)
+            self.navigation.append(button)
+            self.sidebar.box.addWidget(button)
+        self.navigation[0].setChecked(True)
+        self.pages.currentChanged.connect(lambda index: self.navigation[index].setChecked(True))
+        self.sidebar.box.addStretch()
+        self.sidebar.box.addWidget(label(f"FileGuard {__version__}", "Footer"))
+        root.addWidget(self.sidebar)
 
-        def append_batch(start: int = 0) -> None:
-            if generation != self._table_generation:
-                return
-            end = min(start + 200, len(items))
-            for index in range(start, end):
-                item = items[index]
-                snapshot = item.actual if result else item
-                status = item.status.value if result else "В еталоні"
-                tags = (item.status.name,) if result else ()
-                try:
-                    modified = (
-                        datetime.fromtimestamp(snapshot.modified_ns / 1_000_000_000).strftime("%d.%m.%Y %H:%M")
-                        if snapshot is not None else "—"
-                    )
-                except (OverflowError, OSError, ValueError):
-                    modified = "—"
-                self.results_table.insert("", "end", iid=f"row-{index}", tags=tags, values=(
-                    item.path, status, self._format_size(snapshot.size) if snapshot else "—", modified,
-                ))
-            if result is not None:
-                completed = result.completed_at.astimezone().strftime("%d.%m.%Y %H:%M:%S")
-                self.table_footer.set(f"Показано {end} із {len(items)} · усього: {len(result.files)} шляхів · {completed} · {result.duration_seconds:.2f} с")
-            else:
-                self.table_footer.set(f"Показано {end} із {len(items)} файлів еталона · порівняння ще не виконано")
-            if end < len(items):
-                # Додаємо рядки порціями, щоб великі еталони не блокували вікно.
-                self.after(1, lambda: append_batch(end))
+        body = QWidget()
+        body.setObjectName("MainBody")
+        body_box = QVBoxLayout(body)
+        body_box.setContentsMargins(24, 8, 24, 16)
+        body_box.setSpacing(12)
+        chrome = DragBar()
+        chrome.setFixedHeight(32)
+        chrome_box = QHBoxLayout(chrome)
+        chrome_box.setContentsMargins(0, 0, 0, 0)
+        chrome_box.addStretch()
+        for symbol, text, callback in (("minus", "Згорнути", self.showMinimized),
+                                        ("maximize", "Розгорнути або відновити", self._maximize),
+                                        ("close", "Закрити", self._request_close)):
+            control = self.button("", callback, symbol=symbol)
+            control.setAccessibleName(text)
+            control.setToolTip(text)
+            control.setFixedSize(39, 29)
+            control.setObjectName("WindowClose" if symbol == "close" else "WindowControl")
+            chrome_box.addWidget(control)
+        body_box.addWidget(chrome)
+        self.title_label = label("Контроль цілісності", "Title")
+        self.subtitle_label = label("Порівняння файлів зі збереженим еталоном", "Subtitle")
+        body_box.addWidget(self.title_label)
+        body_box.addWidget(self.subtitle_label)
+        body_box.addWidget(self.pages, 1)
+        self.pages.currentChanged.connect(self._page_changed)
+        self._build_check_page()
+        self._build_history_page()
+        self._build_settings_page()
+        self.footer = label("Оберіть папку для початку роботи", "Footer")
+        self.footer.setWordWrap(True)
+        body_box.addWidget(self.footer)
+        root.addWidget(body, 1)
 
-        append_batch()
+    def _page_changed(self, index):
+        self.title_label.setText(("Контроль цілісності", "Історія перевірок", "Налаштування")[index])
+        self.subtitle_label.setText(("Порівняння файлів зі збереженим еталоном",
+                                     "Завершені перевірки та збережені звіти",
+                                     "Параметри нового еталона та оформлення")[index])
 
-    def render_state(self, state: AppState) -> None:
-        """Оновлює віджети зі стану моделі, не змінюючи саму модель."""
-        self.folder_text.set(str(state.selected_folder) if state.selected_folder else "Папку ще не обрано")
-        self.include_subfolders.set(state.include_subfolders)
+    def _build_check_page(self):
+        page = QWidget()
+        box = QVBoxLayout(page)
+        box.setContentsMargins(0, 2, 0, 0)
+        box.setSpacing(12)
+        source = Card(margins=18)
+        top = QHBoxLayout()
+        folder = QLabel()
+        folder.setPixmap(icon("folder", "#e9ab24", 42).pixmap(42, 42))
+        top.addWidget(folder)
+        names = QVBoxLayout()
+        self.folder_name = label("Папку ще не обрано", "FolderName")
+        self.folder_path = label("Оберіть папку, стан якої потрібно контролювати", "Muted")
+        self.folder_path.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        names.addWidget(self.folder_name)
+        names.addWidget(self.folder_path)
+        top.addLayout(names, 1)
+        self.choose_button = self.button("Обрати папку", lambda: self._controller.choose_folder())
+        top.addWidget(self.choose_button)
+        source.box.addLayout(top)
+        metadata = QHBoxLayout()
+        self.subfolders_check = Switch("Вкладені папки")
+        self.subfolders_check.toggled.connect(lambda enabled: self._controller.set_include_subfolders(enabled))
+        metadata.addWidget(self.subfolders_check)
+        self.baseline_summary = label("Еталон не завантажено · SHA-256", "Muted")
+        self.baseline_summary.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        metadata.addWidget(self.baseline_summary, 1)
+        self.issues_button = self.button("Пропущені шляхи", self._show_issues)
+        metadata.addWidget(self.issues_button)
+        self.issues_button.hide()
+        source.box.addLayout(metadata)
+        actions = QHBoxLayout()
+        self.create_baseline_button = self.button("Створити еталон", lambda: self._controller.create_baseline())
+        self.load_baseline_button = self.button("Завантажити еталон", lambda: self._controller.load_baseline())
+        self.check_button = self.button("Перевірити цілісність", lambda: self._controller.check_integrity(), True)
+        for widget in (self.create_baseline_button, self.load_baseline_button, self.check_button):
+            actions.addWidget(widget, 1)
+        source.box.addLayout(actions)
+        self.progress_area = QWidget()
+        progress = QHBoxLayout(self.progress_area)
+        progress.setContentsMargins(0, 0, 0, 0)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setTextVisible(False)
+        progress.addWidget(self.progress_bar, 1)
+        self.cancel_button = self.button("Скасувати", lambda: self._controller.cancel_operation())
+        progress.addWidget(self.cancel_button)
+        source.box.addWidget(self.progress_area)
+        self.progress_area.hide()
+        box.addWidget(source)
+
+        counters = QHBoxLayout()
+        counters.setSpacing(10)
+        self.counter_labels = {}
+        for text, status in (("Усього", None), ("Без змін", FileStatus.UNCHANGED), ("Змінено", FileStatus.CHANGED),
+                             ("Додано", FileStatus.ADDED), ("Видалено", FileStatus.DELETED), ("Помилки", FileStatus.ERROR)):
+            card = Card(name="Counter", margins=12)
+            caption = label(text, "Muted")
+            card.box.addWidget(caption)
+            line = QHBoxLayout()
+            color, background, symbol = TONES[status] if status else ("#354967", "#edf1f7", "file")
+            value = label("—", "Count")
+            value.setStyleSheet(f"color: {color}")
+            self.counter_labels[text] = value
+            line.addWidget(value)
+            line.addStretch()
+            badge = QLabel()
+            badge.setPixmap(icon(symbol, color, 22).pixmap(22, 22))
+            badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            badge.setFixedSize(34, 34)
+            badge.setStyleSheet(f"background:{background}; border-radius:17px")
+            line.addWidget(badge)
+            card.box.addLayout(line)
+            counters.addWidget(card, 1)
+        box.addLayout(counters)
+
+        results = Card(margins=16)
+        toolbar = QHBoxLayout()
+        self.table_title = label("Результати перевірки", "Heading")
+        toolbar.addWidget(self.table_title, 1)
+        self.status_filter = QComboBox()
+        self.status_filter.addItems(["Усі статуси"] + [status.value for status in FileStatus])
+        self.status_filter.setAccessibleName("Фільтр статусу")
+        self.status_filter.currentTextChanged.connect(lambda text: self._controller.set_status_filter(text))
+        toolbar.addWidget(self.status_filter)
+        self.export_button = self.button("Зберегти звіт", lambda: None, symbol="download")
+        self.export_menu = self._export_menu(self.export_button, lambda ext: self._controller.export_result(extension=ext))
+        toolbar.addWidget(self.export_button)
+        results.box.addLayout(toolbar)
+        self.results_model = ResultsModel(self)
+        self.results_table = self._table()
+        self.results_table.setModel(self.results_model)
+        self.results_table.setItemDelegateForColumn(1, StatusDelegate(self.results_table))
+        self.results_table.setColumnWidth(1, 145)
+        self.results_table.setColumnWidth(2, 95)
+        self.results_table.setColumnWidth(3, 160)
+        self.results_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.results_table.selectionModel().selectionChanged.connect(self._sync_details)
+        self.results_table.doubleClicked.connect(self._show_file_details)
+        self.results_table.activated.connect(self._show_file_details)
+        self.results_stack = QStackedWidget()
+        self.results_stack.addWidget(self.results_table)
+        empty = QWidget()
+        empty_box = QVBoxLayout(empty)
+        empty_box.addStretch()
+        self.empty_title = label("Перевірку ще не виконано", "Heading")
+        self.empty_hint = label("Оберіть папку та створіть або завантажте еталон", "Muted")
+        for widget in (self.empty_title, self.empty_hint):
+            widget.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            widget.setWordWrap(True)
+            empty_box.addWidget(widget)
+        empty_box.addStretch()
+        self.results_stack.addWidget(empty)
+        results.box.addWidget(self.results_stack, 1)
+        bottom = QHBoxLayout()
+        self.details_button = self.button("Відомості", self._show_file_details, symbol="info")
+        bottom.addWidget(self.details_button)
+        bottom.addStretch()
+        self.table_footer = label("Результатів поки немає", "Footer")
+        bottom.addWidget(self.table_footer)
+        results.box.addLayout(bottom)
+        box.addWidget(results, 1)
+        self.pages.addWidget(page)
+
+    def _table(self):
+        table = QTableView()
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setShowGrid(False)
+        table.verticalHeader().hide()
+        table.verticalHeader().setDefaultSectionSize(43)
+        table.horizontalHeader().setHighlightSections(False)
+        table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        table.setMinimumHeight(130)
+        return table
+
+    @staticmethod
+    def _export_menu(parent, callback):
+        menu = QMenu(parent)
+        for extension, title in (("txt", "Текстовий звіт (.txt)"), ("csv", "Таблиця CSV (.csv)")):
+            menu.addAction(title, lambda checked=False, ext=extension: callback(ext))
+        parent.setMenu(menu)
+        return menu
+
+    def _build_history_page(self):
+        page = Card(margins=20)
+        top = QHBoxLayout()
+        top.addWidget(label("Збережені результати", "Heading"), 1)
+        self.history_refresh_button = self.button("Оновити", lambda: self._controller.refresh_history(), symbol="refresh")
+        self.history_open_button = self.button("Відкрити", self._open_history)
+        top.addWidget(self.history_refresh_button)
+        top.addWidget(self.history_open_button)
+        page.box.addLayout(top)
+        self.history_table = self._table()
+        self.history_model = QStandardItemModel(0, 6, self)
+        self.history_model.setHorizontalHeaderLabels(["Дата", "Папка", "Усього", "Зміни", "Помилки", "Час, с"])
+        self.history_table.setModel(self.history_model)
+        self.history_table.setColumnWidth(0, 155)
+        self.history_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for index in range(2, 6):
+            self.history_table.setColumnWidth(index, 72)
+        self.history_table.doubleClicked.connect(self._open_history)
+        self.history_table.activated.connect(self._open_history)
+        self.history_table.selectionModel().selectionChanged.connect(self._sync_history)
+        page.box.addWidget(self.history_table, 1)
+        self.history_summary = label("Збережених перевірок поки немає", "Muted")
+        self.history_summary.setWordWrap(True)
+        page.box.addWidget(self.history_summary)
+        self.pages.addWidget(page)
+
+    def _build_settings_page(self):
+        scroll = QScrollArea()
+        scroll.setObjectName("SettingsScroll")
+        scroll.viewport().setObjectName("SettingsViewport")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(scroll.Shape.NoFrame)
+        page = Card(margins=24)
+        page.box.addWidget(label("Параметри нового еталона", "Heading"))
+        self.settings_subfolders_check = Switch("Включати вкладені папки")
+        self.settings_subfolders_check.toggled.connect(lambda enabled: self._controller.set_include_subfolders(enabled))
+        page.box.addWidget(self.settings_subfolders_check)
+        note = label("Перевірка використовує параметри завантаженого еталона. Алгоритм: SHA-256.", "Muted")
+        note.setWordWrap(True)
+        page.box.addWidget(note)
+        page.box.addSpacing(12)
+        page.box.addWidget(label("Виключення", "Heading"))
+        hint = label("Одне правило на рядок. Приклади: *.tmp, .git, __pycache__, cache/, logs/*.log.", "Muted")
+        hint.setWordWrap(True)
+        page.box.addWidget(hint)
+        self.exclusions_input = QPlainTextEdit()
+        self.exclusions_input.setAccessibleName("Правила виключення")
+        self.exclusions_input.setFont(QFont("Consolas", 10))
+        self.exclusions_input.setMinimumHeight(120)
+        self.exclusions_input.setMaximumHeight(170)
+        page.box.addWidget(self.exclusions_input)
+        self.apply_exclusions_button = self.button("Застосувати виключення", self._apply_exclusions)
+        page.box.addWidget(self.apply_exclusions_button, 0, Qt.AlignmentFlag.AlignLeft)
+        page.box.addSpacing(12)
+        page.box.addWidget(label("Оформлення", "Heading"))
+        self.glass_check = Switch("Ефект матового скла")
+        self.glass_check.toggled.connect(lambda enabled: self._controller.set_glass_enabled(enabled))
+        page.box.addWidget(self.glass_check)
+        self.glass_hint = label("Якщо ефект недоступний, використовується світлий непрозорий фон.", "Muted")
+        self.glass_hint.setWordWrap(True)
+        page.box.addWidget(self.glass_hint)
+        self.save_settings_button = self.button("Зберегти налаштування", lambda: self._controller.save_settings(), True)
+        page.box.addWidget(self.save_settings_button, 0, Qt.AlignmentFlag.AlignLeft)
+        automatic = label("Застосовані параметри також зберігаються під час закриття програми.", "Muted")
+        automatic.setWordWrap(True)
+        page.box.addWidget(automatic)
+        page.box.addStretch()
+        scroll.setWidget(page)
+        # setWidget вмикає прямокутну заливку палітрою; вона перекривала
+        # світлий фон у прозорих кутах округленої картки на темній Windows.
+        page.setAutoFillBackground(False)
+        self.pages.addWidget(scroll)
+
+    def set_controller(self, controller):
+        self._controller = controller
+
+    def render_state(self, state):
+        """Синхронізація не викликає повторних команд через сигнали віджетів."""
         self._busy = state.busy
-        self._history_available = state.history_available
-        self.history_refresh_button.configure(state="normal" if state.history_available and not state.busy else "disabled")
-        self._sync_history_button()
-        if state.history_entries is not self._rendered_history:
-            self._rendered_history = state.history_entries
-            children = self.history_table.get_children()
-            if children:
-                self.history_table.delete(*children)
-            for entry in state.history_entries:
-                changes = sum(entry.counts.get(s, 0) for s in (FileStatus.CHANGED, FileStatus.ADDED, FileStatus.DELETED))
-                self.history_table.insert("", "end", iid=entry.identifier, values=(
-                    entry.completed_at.astimezone().strftime("%d.%m.%Y %H:%M:%S"), str(entry.root_folder),
-                    sum(entry.counts.values()), changes, entry.counts.get(FileStatus.ERROR, 0),
-                    f"{entry.duration_seconds:.2f}",
-                ))
-            self.history_summary.set(f"Показано {len(state.history_entries)} останніх перевірок (до 200). Повні результати доступні через «Відкрити»."
-                                     if state.history_entries else "Історія перевірок порожня")
-        self.status_text.set(state.status_message)
-        enabled = "disabled" if state.busy else "normal"
-        self.choose_button.configure(state=enabled)
-        self.load_baseline_button.configure(state=enabled)
-        self.subfolders_check.configure(state=enabled)
-        self.settings_subfolders_check.configure(state=enabled)
-        self.apply_exclusions_button.configure(state=enabled)
-        self.save_settings_button.configure(state=enabled)
-        self.exclusions_input.configure(state=enabled)
-        if state.exclusion_patterns != self._rendered_patterns:
-            self.exclusions_input.configure(state="normal")
-            self.exclusions_input.delete("1.0", "end")
-            self.exclusions_input.insert("1.0", "\n".join(state.exclusion_patterns))
-            self.exclusions_input.configure(state=enabled)
-            self._rendered_patterns = state.exclusion_patterns
-        self.create_baseline_button.configure(
-            state="normal" if state.selected_folder is not None and not state.busy else "disabled"
-        )
-        self.check_button.configure(state="normal" if state.baseline is not None and not state.busy else "disabled")
-        self.export_button.configure(state="normal" if state.check_result is not None and not state.busy else "disabled")
-        if self._saved_result_window is not None and self._saved_result_window.winfo_exists():
-            self._saved_result_window.set_busy(state.busy)
-        self.cancel_button.configure(state="disabled" if state.cancel_requested else "normal")
-        if state.busy:
-            self.progress_area.grid()
-            if not self._progress_running:
-                self.progress_bar.start(15)
-                self._progress_running = True
-        else:
-            self.progress_bar.stop()
-            self._progress_running = False
-            self.progress_area.grid_remove()
-        baseline = state.baseline
-        result = state.check_result
-        self.status_filter.configure(state="readonly" if result is not None and not state.busy else "disabled")
-        self.status_filter.set(state.status_filter.value if state.status_filter is not None else "Усі статуси")
-        if (baseline is not self._rendered_baseline or result is not self._rendered_check
-                or state.status_filter != self._rendered_filter):
-            counts = result.counts if result else {}
-            self.counter_labels["Усього"].configure(
-                text=str(len(result.files)) if result else str(len(baseline.files)) if baseline else "—"
-            )
-            for status in FileStatus:
-                label = "Помилки" if status == FileStatus.ERROR else status.value
-                self.counter_labels[label].configure(text=str(counts.get(status, 0)) if result else "—")
-            self._error_count = counts.get(FileStatus.ERROR, 0)
-            self._render_files(baseline, result, state.status_filter)
-        if baseline is not None:
+        self._result, self._baseline = state.check_result, state.baseline
+        self.folder_name.setText(state.selected_folder.name if state.selected_folder else "Папку ще не обрано")
+        self.folder_path.setText(str(state.selected_folder) if state.selected_folder else "Оберіть папку для контролю")
+        self.folder_path.setToolTip(self.folder_path.text())
+        if state.baseline:
+            baseline = state.baseline
             name = state.baseline_path.name if state.baseline_path else "Еталон"
-            self.baseline_name.set(name if len(name) <= 25 else name[:22] + "…")
-            self.baseline_summary.set(f"SHA-256 · файлів: {len(baseline.files)}")
-            try:
-                created = baseline.created_at.astimezone().strftime("%d.%m.%Y %H:%M:%S")
-            except (OverflowError, OSError, ValueError):
-                created = baseline.created_at.isoformat(timespec="seconds")
-            self.baseline_details.set(
-                f"Створено: {created} · вкладені папки: {'так' if baseline.include_subfolders else 'ні'}"
-                + f" · правил виключення: {len(baseline.exclusion_patterns)}"
-            )
+            self.baseline_summary.setText(f"{name} · SHA-256 · {len(baseline.files)} файлів")
+            self.baseline_summary.setToolTip(f"Створено: {baseline.created_at.astimezone():%d.%m.%Y %H:%M}\n"
+                                             f"Вкладені папки: {'так' if baseline.include_subfolders else 'ні'}\n"
+                                             f"Правила виключення: {', '.join(baseline.exclusion_patterns) or 'немає'}")
         else:
-            self.baseline_name.set("Еталон не завантажено")
-            self.baseline_summary.set("Алгоритм: SHA-256")
-            self.baseline_details.set("")
-        if result and self._error_count:
-            self.issues_button.configure(text=f"Помилки перевірки: {self._error_count}")
-            self.issues_button.grid()
-        elif result is None and baseline and baseline.issues:
-            self.issues_button.configure(text=f"Пропущені шляхи: {len(baseline.issues)}")
-            self.issues_button.grid()
+            self.baseline_summary.setText("Еталон не завантажено · SHA-256")
+        for switch in (self.subfolders_check, self.settings_subfolders_check):
+            with QSignalBlocker(switch):
+                switch.setChecked(state.include_subfolders)
+        with QSignalBlocker(self.status_filter):
+            self.status_filter.setCurrentText(state.status_filter.value if state.status_filter else "Усі статуси")
+        with QSignalBlocker(self.glass_check):
+            self.glass_check.setChecked(state.glass_enabled)
+        if self._glass_requested != state.glass_enabled:
+            self._glass_requested = state.glass_enabled
+            self._update_glass()
+        if self._rendered_patterns != state.exclusion_patterns:
+            self.exclusions_input.setPlainText("\n".join(state.exclusion_patterns))
+            self._rendered_patterns = state.exclusion_patterns
+        # Стан змінюється часто під час прогресу, але завершену таблицю не перебудовуємо.
+        signature = (id(state.baseline), id(state.check_result), state.status_filter)
+        if signature != self._rendered:
+            self._rendered = signature
+            self._counts = state.check_result.counts if state.check_result else {}
+            rows = (tuple(item for item in state.check_result.files
+                          if state.status_filter is None or item.status == state.status_filter)
+                    if state.check_result else state.baseline.files if state.baseline else ())
+            self.results_model.set_rows(rows, state.check_result is not None)
+            self.results_stack.setCurrentIndex(0 if rows else 1)
+            self.empty_title.setText("За цим фільтром немає записів" if state.check_result and state.check_result.files
+                                     else "Файлів немає" if state.baseline else "Перевірку ще не виконано")
+            self.empty_hint.setText("Спробуйте обрати інший статус" if state.check_result and state.check_result.files
+                                    else "Оберіть папку та створіть або завантажте еталон" if not state.baseline
+                                    else "Еталон або завершена перевірка не містить файлів")
+        result = state.check_result
+        for index, (text, value) in enumerate(self.counter_labels.items()):
+            number = (len(result.files) if index == 0 else self._counts[list(FileStatus)[index - 1]]) if result else (
+                len(state.baseline.files) if index == 0 and state.baseline else None)
+            value.setText(str(number) if number is not None else "—")
+        self.table_title.setText("Попередні результати" if state.busy and result else
+                                 "Результати перевірки" if result else "Файли еталона" if state.baseline else "Результати перевірки")
+        total = len(result.files) if result else len(state.baseline.files) if state.baseline else 0
+        finished = f" · {result.completed_at.astimezone():%d.%m.%Y %H:%M}" if result else ""
+        self.table_footer.setText(f"Показано {len(self.results_model.rows)} із {total}{finished}")
+        error_count = self._counts[FileStatus.ERROR] if result else len(state.baseline.issues) if state.baseline else 0
+        self.issues_button.setVisible(bool(error_count))
+        self.issues_button.setText("Помилки перевірки" if result else "Пропущені шляхи")
+        self.progress_area.setVisible(state.busy)
+        self.cancel_button.setEnabled(not state.cancel_requested)
+        for widget in (self.choose_button, self.load_baseline_button, self.subfolders_check,
+                       self.settings_subfolders_check, self.apply_exclusions_button, self.exclusions_input,
+                       self.save_settings_button, self.glass_check, self.issues_button):
+            widget.setEnabled(not state.busy)
+        self.create_baseline_button.setEnabled(not state.busy and state.selected_folder is not None)
+        self.check_button.setEnabled(not state.busy and state.baseline is not None)
+        self.export_button.setEnabled(not state.busy and result is not None)
+        self.status_filter.setEnabled(not state.busy and result is not None)
+        self.history_refresh_button.setEnabled(not state.busy and state.history_available)
+        self._history_available = state.history_available
+        if self._rendered_history != state.history_entries:
+            self._rendered_history = state.history_entries
+            self.history_model.removeRows(0, self.history_model.rowCount())
+            for entry in state.history_entries:
+                changes = sum(entry.counts[status] for status in (FileStatus.CHANGED, FileStatus.ADDED, FileStatus.DELETED))
+                values = [entry.completed_at.astimezone().strftime("%d.%m.%Y %H:%M"), str(entry.root_folder),
+                          str(sum(entry.counts.values())), str(changes), str(entry.counts[FileStatus.ERROR]),
+                          f"{entry.duration_seconds:.2f}"]
+                items = [QStandardItem(value) for value in values]
+                items[0].setData(entry.identifier, Qt.ItemDataRole.UserRole)
+                for item in items:
+                    item.setToolTip(item.text())
+                self.history_model.appendRow(items)
+        self.history_summary.setText(f"Показано {len(state.history_entries)} останніх перевірок (до 200). Повний звіт доступний через «Відкрити».")
+        self._sync_details()
+        self._sync_history()
+        if self._saved_result_window:
+            self._saved_result_window.set_busy(state.busy)
+        self.footer.setText(state.status_message)
+
+    def _update_glass(self):
+        if not self.isVisible():
+            return
+        self.glass_active = apply_glass(int(self.winId()), bool(self._glass_requested))
+        self.glass_hint.setText("Ефект скла увімкнено. Читабельність вмісту збережено." if self.glass_active else
+                                "Використовується світлий непрозорий фон." if not self._glass_requested else
+                                "Система використовує світлий непрозорий фон замість ефекту скла.")
+        self.update()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        QTimer.singleShot(0, self, self._update_glass)
+
+    def _apply_exclusions(self):
+        self._controller.set_exclusion_patterns(tuple(line.strip() for line in self.exclusions_input.toPlainText().splitlines() if line.strip()))
+
+    def _sync_details(self, *args):
+        self.details_button.setEnabled(not self._busy and bool(self.results_table.selectionModel().selectedRows()))
+
+    def _sync_history(self, *args):
+        self.history_open_button.setEnabled(not self._busy and getattr(self, "_history_available", False)
+                                            and bool(self.history_table.selectionModel().selectedRows()))
+
+    def _open_history(self, *args):
+        rows = self.history_table.selectionModel().selectedRows()
+        if rows and not self._busy:
+            self._controller.open_history(rows[0].data(Qt.ItemDataRole.UserRole))
+
+    def _show_file_details(self, *args):
+        rows = self.results_table.selectionModel().selectedRows()
+        if not rows or self._busy:
+            return
+        item = self.results_model.rows[rows[0].row()]
+        before, after = (item.expected, item.actual) if self._result else (item, None)
+        lines = [item.path, "", f"Статус: {item.status.value if self._result else 'В еталоні'}",
+                 item.message if self._result else "Порівняння ще не виконано."]
+        for title, snapshot in (("Еталон", before), ("Поточний стан", after)):
+            lines += ["", title, f"Розмір: {display_size(snapshot.size)}" if snapshot else "Дані відсутні"]
+            if snapshot:
+                lines += [f"Дата: {display_modified(snapshot)}", f"SHA-256: {snapshot.sha256}"]
+        self._text_dialog("Відомості про файл", "\n".join(lines))
+
+    def _show_issues(self):
+        issues = [(item.path, item.message) for item in self._result.files if item.status == FileStatus.ERROR] if self._result else (
+            [(item.path, item.message) for item in self._baseline.issues] if self._baseline else [])
+        text = "\n\n".join(f"{path}\n{message}" for path, message in issues[:1000])
+        if len(issues) > 1000:
+            text += "\n\nПоказано перші 1000 записів. Повний список збережено у результаті."
+        self._text_dialog("Помилки перевірки" if self._result else "Пропущені шляхи", text)
+
+    def _text_dialog(self, title, text):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.resize(780, 500)
+        box = QVBoxLayout(dialog)
+        box.setContentsMargins(20, 20, 20, 20)
+        box.addWidget(label(title, "Heading"))
+        content = QPlainTextEdit()
+        content.setReadOnly(True)
+        content.setPlainText(text)
+        content.setFont(QFont("Consolas", 10))
+        box.addWidget(content)
+        self._detail_windows.append(dialog)
+        dialog.finished.connect(lambda: self._detail_windows.remove(dialog))
+        dialog.show()
+
+    def show_saved_result(self, result, text):
+        if self._saved_result_window:
+            self._saved_result_window.close()
+            self._saved_result_window.deleteLater()
+        self._saved_result_window = SavedResultWindow(self, result, text,
+                                                      lambda saved, ext: self._controller.export_result(saved, ext))
+        self._saved_result_window.show()
+
+    def ask_directory(self, initial_directory):
+        return QFileDialog.getExistingDirectory(self, "Оберіть папку для контролю цілісності", initial_directory or str(Path.home()))
+
+    def ask_save_baseline(self, directory, filename):
+        return QFileDialog.getSaveFileName(self, "Зберегти еталон", str(directory / filename), "Еталон JSON (*.json)")[0]
+
+    def ask_open_baseline(self, directory):
+        return QFileDialog.getOpenFileName(self, "Завантажити еталон", str(directory), "Еталон JSON (*.json);;Усі файли (*)")[0]
+
+    def ask_save_report(self, directory, filename, extension):
+        title = "Текстовий звіт (*.txt)" if extension == "txt" else "Таблиця CSV (*.csv)"
+        return QFileDialog.getSaveFileName(self, "Зберегти звіт", str(directory / filename), title)[0]
+
+    def show_error(self, title, message):
+        QMessageBox.warning(self, title, message)
+
+    def schedule(self, delay_ms, callback):
+        QTimer.singleShot(delay_ms, self, callback)
+
+    def get_window_size(self):
+        return max(1080, self.width()), max(820, self.height())
+
+    def apply_window_size(self, size):
+        area = self.screen().availableGeometry()
+        self.resize(max(1080, min(size[0], area.width() - 40)), max(820, min(size[1], area.height() - 40)))
+        self.move(area.center() - self.rect().center())
+
+    def _maximize(self):
+        self.showNormal() if self.isMaximized() else self.showMaximized()
+
+    def _request_close(self):
+        self._controller.request_close() if self._controller else self.close()
+
+    def close(self):
+        self._allow_close = True
+        return super().close()
+
+    def closeEvent(self, event):
+        if self._allow_close or not self._controller:
+            event.accept()
         else:
-            self.issues_button.grid_remove()
-        if result is not None:
-            self.table_title.set("Попередні результати перевірки" if state.busy else "Результати перевірки")
-        self._sync_details_button()
-        if result is not None and not self._visible_files:
-            self.empty_title.set("Немає результатів за цим фільтром")
-            self.folder_hint.set("Оберіть інший статус або «Усі статуси».")
-        elif baseline is not None and not baseline.files and result is None:
-            self.empty_title.set("Еталон не містить файлів")
-            self.folder_hint.set("Папка порожня або всі її файли виключені правилами.")
-        else:
-            self.empty_title.set("Перевірку ще не виконано")
-            self.folder_hint.set(
-            "Папку обрано. Результати з’являться після виконання перевірки."
-            if state.selected_folder
-            else "Оберіть папку, стан якої потрібно контролювати."
-            )
+            event.ignore()
+            self._controller.request_close()

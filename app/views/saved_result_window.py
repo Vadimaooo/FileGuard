@@ -1,52 +1,57 @@
-"""Окреме вікно історії не змінює поточну перевірку або її еталон."""
+"""Окремий перегляд завершеної перевірки без повторного читання файлів."""
 
-import tkinter as tk
-from tkinter import ttk
+from PySide6.QtCore import QTimer
+from PySide6.QtGui import QFont
+from PySide6.QtWidgets import QDialog, QHBoxLayout, QMenu, QPlainTextEdit, QPushButton, QVBoxLayout
+
+from app.views.icons import icon
+from app.views.widgets import label
 
 
-class SavedResultWindow(tk.Toplevel):
-    def __init__(self, parent, result, text: str, on_export=None):
+class SavedResultWindow(QDialog):
+    def __init__(self, parent, result, text, on_export):
         super().__init__(parent)
-        self.title("Збережена перевірка — FileGuard")
-        self.transient(parent)
-        x = max(0, parent.winfo_rootx() + (parent.winfo_width() - 950) // 2)
-        y = max(0, parent.winfo_rooty() + (parent.winfo_height() - 620) // 2)
-        self.geometry(f"950x620+{x}+{y}")
-        self.minsize(650, 400)
-        self._append_after = None
-        self.bind("<Destroy>", self._cancel_append, add="+")
-        toolbar = ttk.Frame(self, padding=12)
-        toolbar.pack(fill="x")
-        ttk.Label(toolbar, text="Збережений результат · поточні файли повторно не читаються").pack(side="left")
-        if on_export:
-            self.export_button = ttk.Menubutton(toolbar, text="Зберегти звіт")
-            self.export_menu = tk.Menu(self.export_button, tearoff=False)
-            for extension, label in (("txt", "Текстовий звіт (.txt)"), ("csv", "Таблиця CSV (.csv)")):
-                self.export_menu.add_command(label=label, command=lambda ext=extension: on_export(result, ext))
-            self.export_button.configure(menu=self.export_menu)
-            self.export_button.pack(side="right")
-        content = tk.Text(self, wrap="word", font=("Consolas", 10), background="white", padx=14, pady=12)
-        scroll = ttk.Scrollbar(self, command=content.yview)
-        scroll.pack(side="right", fill="y")
-        content.pack(fill="both", expand=True)
-        content.configure(yscrollcommand=scroll.set, state="disabled")
-        self.content = content
+        self.setWindowTitle("Збережена перевірка — FileGuard")
+        self.resize(960, 650)
+        self.setMinimumSize(680, 420)
+        box = QVBoxLayout(self)
+        box.setContentsMargins(24, 22, 24, 24)
+        box.setSpacing(16)
+        top = QHBoxLayout()
+        top.addWidget(label("Збережена перевірка", "Heading"))
+        top.addStretch()
+        self.export_button = QPushButton("Зберегти звіт")
+        self.export_button.setIcon(icon("download"))
+        self.export_menu = QMenu(self)
+        for extension, title in (("txt", "Текстовий звіт (.txt)"), ("csv", "Таблиця CSV (.csv)")):
+            self.export_menu.addAction(title, lambda checked=False, ext=extension: on_export(result, ext))
+        self.export_button.setMenu(self.export_menu)
+        top.addWidget(self.export_button)
+        box.addLayout(top)
+        box.addWidget(label("Збережений результат · поточні файли повторно не читаються", "Muted"))
+        self.content = QPlainTextEdit()
+        self.content.setReadOnly(True)
+        self.content.setFont(QFont("Consolas", 10))
+        box.addWidget(self.content)
+        self._text, self._position = text, 0
+        self._append_timer = QTimer(self)
+        self._append_timer.setInterval(1)
+        self._append_timer.timeout.connect(self._append_chunk)
+        self._append_timer.start()
 
-        def append(start=0):
-            self._append_after = None
-            content.configure(state="normal")
-            content.insert("end", text[start:start + 16384])
-            content.configure(state="disabled")
-            if start + 16384 < len(text):
-                self._append_after = self.after(1, lambda: append(start + 16384))
-
-        append()
-
-    def _cancel_append(self, event):
-        if event.widget is self and self._append_after is not None:
-            self.after_cancel(self._append_after)
-            self._append_after = None
+    def _append_chunk(self):
+        cursor = self.content.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        cursor.insertText(self._text[self._position:self._position + 16384])
+        self._position += 16384
+        if self._position >= len(self._text):
+            self._append_timer.stop()
+            self._text = ""
+            self.content.verticalScrollBar().setValue(0)
 
     def set_busy(self, busy):
-        if hasattr(self, "export_button"):
-            self.export_button.configure(state="disabled" if busy else "normal")
+        self.export_button.setEnabled(not busy)
+
+    def closeEvent(self, event):
+        self._append_timer.stop()
+        super().closeEvent(event)

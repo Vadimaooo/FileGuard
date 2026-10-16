@@ -22,7 +22,8 @@ class SettingsStorage:
                 "include_subfolders": settings.include_subfolders,
                 "exclusion_patterns": list(settings.exclusion_patterns),
                 "status_filter": settings.status_filter.value if settings.status_filter else None,
-                "window_size": list(settings.window_size) if settings.window_size else None}
+                "window_size": list(settings.window_size) if settings.window_size else None,
+                "glass_enabled": settings.glass_enabled}
 
     @staticmethod
     def _validate(document):
@@ -44,7 +45,10 @@ class SettingsStorage:
                                  or any(type(value) is not int for value in size)
                                  or not (980 <= size[0] <= 10000 and 820 <= size[1] <= 10000)):
             raise ValueError("Некоректний розмір вікна в налаштуваннях.")
-        return AppSettings(Path(folder) if folder else None, recursive, patterns, status, tuple(size) if size else None)
+        glass = document.get("glass_enabled", True)
+        if type(glass) is not bool:
+            raise ValueError("Параметр ефекту скла повинен бути логічним значенням.")
+        return AppSettings(Path(folder) if folder else None, recursive, patterns, status, tuple(size) if size else None, glass)
 
     def load(self) -> AppSettings:
         if not self.path.exists():

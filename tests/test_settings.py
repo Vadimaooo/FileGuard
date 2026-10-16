@@ -43,7 +43,7 @@ class SettingsTests(HistoryFixture, unittest.TestCase):
         original = self.settings_storage._document(self.preferences)
         invalid = {"version": 99, "last_folder": "relative", "include_subfolders": 1,
                    "exclusion_patterns": ["../escape"], "status_filter": "unknown",
-                   "window_size": [980, True]}
+                   "window_size": [980, True], "glass_enabled": "yes"}
         for key, value in invalid.items():
             with self.subTest(key=key):
                 document = dict(original, **{key: value})
@@ -149,6 +149,19 @@ class SettingsTests(HistoryFixture, unittest.TestCase):
         self.assertTrue(view.closed)
         self.assertEqual(save.call_count, 1)
         self.assertEqual(len(view.errors), 1)
+
+    def test_legacy_preferences_and_glass_choice_survive_restart(self):
+        document = self.settings_storage._document(self.preferences)
+        document.pop("glass_enabled")
+        self.settings_storage.path.write_text(json.dumps(document), encoding="utf-8")
+        self.assertTrue(self.settings_storage.load().glass_enabled)
+        controller, view = self.controller()
+        controller.start()
+        self.finish(controller, view)
+        controller.set_glass_enabled(False)
+        controller.save_settings()
+        self.finish(controller, view)
+        self.assertFalse(self.settings_storage.load().glass_enabled)
 
 
 if __name__ == "__main__":
