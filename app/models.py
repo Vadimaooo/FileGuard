@@ -93,6 +93,15 @@ class HistoryEntry:
     counts: dict[FileStatus, int]
 
 
+@dataclass(frozen=True)
+class AppSettings:
+    last_folder: Path | None = None
+    include_subfolders: bool = True
+    exclusion_patterns: tuple[str, ...] = ()
+    status_filter: FileStatus | None = None
+    window_size: tuple[int, int] | None = None
+
+
 @dataclass
 class AppState:
     """Поточні параметри роботи застосунку в межах одного запуску."""
@@ -103,6 +112,7 @@ class AppState:
     status_filter: FileStatus | None = None
     history_available: bool = False
     history_entries: tuple[HistoryEntry, ...] = ()
+    window_size: tuple[int, int] | None = None
     baseline: Baseline | None = None
     baseline_path: Path | None = None
     check_result: CheckResult | None = None

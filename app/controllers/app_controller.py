@@ -7,7 +7,7 @@ from queue import Empty, Full, Queue, SimpleQueue
 from threading import Event, Thread
 from typing import Callable, Protocol
 
-from app.models import AppState, Baseline, CheckResult, FileStatus, HistoryEntry, ScanProgress
+from app.models import AppSettings, AppState, Baseline, CheckResult, FileStatus, HistoryEntry, ScanProgress
 from app.services.baseline_storage import BaselineStorage
 from app.services.directory_service import DirectoryService
 from app.services.integrity_service import IntegrityService, OperationCancelled, check_cancelled
@@ -15,6 +15,7 @@ from app.services.exclusions import ExclusionRules
 from app.services.history_storage import HistoryStorage
 from app.services.report_codec import report_text
 from app.services.report_service import ReportService
+from app.services.settings_storage import SettingsStorage
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,10 @@ class AppView(Protocol):
 
     def ask_save_report(self, directory: Path, filename: str, extension: str) -> str: ...
 
+    def get_window_size(self) -> tuple[int, int]: ...
+
+    def apply_window_size(self, size: tuple[int, int]) -> None: ...
+
 
 class AppController:
     """Обробляє команди; не створює віджетів і не обчислює хешів."""
@@ -55,6 +60,7 @@ class AppController:
         baseline_storage: BaselineStorage | None = None,
         history_storage: HistoryStorage | None = None,
         report_service: ReportService | None = None,
+        settings_storage: SettingsStorage | None = None,
     ) -> None:
         self.state = state
         self.view = view
@@ -63,6 +69,11 @@ class AppController:
         self.baseline_storage = baseline_storage or BaselineStorage()
         self.history_storage = history_storage
         self.report_service = report_service or ReportService()
+        self.settings_storage = settings_storage
+        self._settings_dirty = False
+        # До завершення читання не можна замінювати збережені параметри типовими.
+        self._settings_read_failed = settings_storage is not None
+        self._close_save_started = False
         self.state.history_available = history_storage is not None
         self._cancel = Event()
         self._progress_queue: Queue[ScanProgress] = Queue(maxsize=1)
@@ -74,8 +85,22 @@ class AppController:
     def start(self) -> None:
         """Показати початковий стан застосунку."""
         self.view.render_state(self.state)
-        if self.history_storage is not None:
-            self.refresh_history()
+        if self.history_storage is not None or self.settings_storage is not None:
+            def task():
+                values = {"settings": None, "entries": None, "settings_failed": False, "warnings": []}
+                if self.settings_storage is not None:
+                    try:
+                        values["settings"] = self.settings_storage.load()
+                    except Exception as error:
+                        values["settings_failed"] = True
+                        values["warnings"].append(f"Налаштування не завантажено: {error}")
+                if self.history_storage is not None:
+                    try:
+                        values["entries"] = self.history_storage.list_entries()
+                    except Exception as error:
+                        values["warnings"].append(f"Історія недоступна: {error}")
+                return values
+            self._start_task(task, "Завантаження локальних даних…", "startup")
 
     def choose_folder(self) -> None:
         """Отримати вибір із діалогу та передати шлях на перевірку сервісу."""
@@ -103,6 +128,7 @@ class AppController:
             self.state.baseline_path = None
         self.state.check_result = None
         self.state.selected_folder = resolved
+        self._settings_dirty = True
         self.state.status_message = "Папку обрано · перевірку ще не виконано"
         self.view.render_state(self.state)
         return True
@@ -112,6 +138,7 @@ class AppController:
         if self.state.busy:
             return
         self.state.include_subfolders = bool(enabled)
+        self._settings_dirty = True
         if self.state.baseline is not None:
             self.state.status_message = "Параметр нового еталона змінено · перевірка використовує параметри еталона"
         self.view.render_state(self.state)
@@ -152,12 +179,14 @@ class AppController:
             self.view.show_error("Некоректні виключення", str(error))
             return
         self.state.status_message = "Виключення застосовано для нового еталона · чинний еталон зберігає власні правила"
+        self._settings_dirty = True
         self.view.render_state(self.state)
 
     def set_status_filter(self, status: str) -> None:
         if self.state.busy:
             return
         self.state.status_filter = None if status == "Усі статуси" else FileStatus(status)
+        self._settings_dirty = True
         self.view.render_state(self.state)
 
     def load_baseline(self) -> None:
@@ -228,6 +257,18 @@ class AppController:
 
         self._start_task(task, "Збереження звіту…", "exported")
 
+    def save_settings(self) -> None:
+        if self.state.busy or self.settings_storage is None:
+            return
+        settings = AppSettings(self.state.selected_folder, self.state.include_subfolders,
+                               self.state.exclusion_patterns, self.state.status_filter, self.view.get_window_size())
+
+        def task():
+            self.settings_storage.save(settings, self._cancel)
+            return settings
+
+        self._start_task(task, "Збереження налаштувань…", "settings_saved")
+
     def _report_progress(self, progress: ScanProgress) -> None:
         # Зберігаємо лише найновіше повідомлення, щоб великі папки не переповнили чергу.
         try:
@@ -286,7 +327,27 @@ class AppController:
         self.state.busy = False
         self.state.cancel_requested = False
         warning = ""
-        if kind == "checked":
+        if kind == "startup":
+            settings = value["settings"]
+            self._settings_read_failed = value["settings_failed"]
+            if settings is not None:
+                self.state.selected_folder = settings.last_folder
+                self.state.include_subfolders = settings.include_subfolders
+                self.state.exclusion_patterns = settings.exclusion_patterns
+                self.state.status_filter = settings.status_filter
+                self.state.window_size = settings.window_size
+                if settings.window_size is not None:
+                    self.view.apply_window_size(settings.window_size)
+            if value["entries"] is not None:
+                self.state.history_entries = value["entries"]
+            warning = "\n".join(value["warnings"])
+            self.state.status_message = "Локальні дані завантажено · оберіть або створіть еталон"
+        elif kind == "settings_saved":
+            self._settings_dirty = False
+            self._settings_read_failed = False
+            self.state.window_size = value.window_size
+            self.state.status_message = "Налаштування збережено"
+        elif kind == "checked":
             self.state.check_result = value.result
             if value.entries is not None:
                 self.state.history_entries = value.entries
@@ -315,6 +376,7 @@ class AppController:
             self.state.selected_folder = baseline.root_folder
             self.state.include_subfolders = baseline.include_subfolders
             self.state.exclusion_patterns = baseline.exclusion_patterns
+            self._settings_dirty = True
             self.state.check_result = None
             action = "Еталон створено" if kind == "created" else "Еталон завантажено"
             self.state.status_message = f"{action} · файлів: {len(baseline.files)}"
@@ -324,20 +386,22 @@ class AppController:
             self.state.status_message = (
                 "Перевірку скасовано · неповні результати не застосовано"
                 if self._task_kind == "checked"
-                else "Операцію скасовано · файл еталона не змінено"
+                else "Операцію скасовано · завершені дані збережено"
             )
         else:
             self.state.status_message = "Операцію не завершено · попередній стан збережено"
         self.view.render_state(self.state)
-        if self._close_requested:
-            self.view.close()
-        elif kind == "error":
+        if kind == "error":
             titles = {"checked": "Не вдалося перевірити цілісність", "history_list": "Історія недоступна",
-                      "history_open": "Не вдалося відкрити запис історії", "exported": "Не вдалося зберегти звіт"}
+                      "history_open": "Не вдалося відкрити запис історії", "exported": "Не вдалося зберегти звіт",
+                      "settings_saved": "Не вдалося зберегти налаштування"}
             title = titles.get(self._task_kind, "Не вдалося опрацювати еталон")
             self.view.show_error(title, str(value))
         elif warning:
-            self.view.show_error("Результат отримано, історія недоступна", warning)
+            title = "Не всі локальні дані завантажено" if kind == "startup" else "Результат отримано, історія недоступна"
+            self.view.show_error(title, warning)
+        if self._close_requested:
+            self._finish_close()
 
     def cancel_operation(self) -> None:
         if self.state.busy:
@@ -351,5 +415,15 @@ class AppController:
         if self.state.busy:
             self._close_requested = True
             self.cancel_operation()
+        else:
+            self._close_requested = True
+            self._finish_close()
+
+    def _finish_close(self):
+        # Зіпсований файл не перезаписується типовими значеннями без дії користувача.
+        if (self.settings_storage is not None and not self._close_save_started
+                and (not self._settings_read_failed or self._settings_dirty)):
+            self._close_save_started = True
+            self.save_settings()
         else:
             self.view.close()

@@ -357,6 +357,10 @@ class MainWindow(tk.Tk):
         self.exclusions_input.pack(anchor="w", fill="x")
         self.apply_exclusions_button = ttk.Button(panel, text="Застосувати виключення", command=self._apply_exclusions)
         self.apply_exclusions_button.pack(anchor="w", pady=(10, 0))
+        self.save_settings_button = ttk.Button(panel, text="Зберегти налаштування", command=self._save_settings)
+        self.save_settings_button.pack(anchor="w", pady=(16, 0))
+        ttk.Label(panel, text="Застосовані параметри також зберігаються під час закриття програми.",
+                  style="SurfaceMuted.TLabel").pack(anchor="w", pady=(8, 0))
 
     def set_controller(self, controller: AppController) -> None:
         self._controller = controller
@@ -389,6 +393,20 @@ class MainWindow(tk.Tk):
     def _change_filter(self, event=None) -> None:
         if self._controller is not None:
             self._controller.set_status_filter(self.status_filter.get())
+
+    def _save_settings(self):
+        if self._controller is not None:
+            self._controller.save_settings()
+
+    def get_window_size(self):
+        return max(980, self.winfo_width()), max(820, self.winfo_height())
+
+    def apply_window_size(self, size):
+        width = max(980, min(size[0], self.winfo_screenwidth() - 80))
+        height = max(820, min(size[1], self.winfo_screenheight() - 100))
+        x = max(0, (self.winfo_screenwidth() - width) // 2)
+        y = max(0, (self.winfo_screenheight() - height) // 2 - 20)
+        self.geometry(f"{width}x{height}+{x}+{y}")
 
     def _refresh_history(self) -> None:
         if self._controller is not None:
@@ -637,6 +655,7 @@ class MainWindow(tk.Tk):
         self.subfolders_check.configure(state=enabled)
         self.settings_subfolders_check.configure(state=enabled)
         self.apply_exclusions_button.configure(state=enabled)
+        self.save_settings_button.configure(state=enabled)
         self.exclusions_input.configure(state=enabled)
         if state.exclusion_patterns != self._rendered_patterns:
             self.exclusions_input.configure(state="normal")

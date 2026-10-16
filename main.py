@@ -8,6 +8,7 @@ from app.services.integrity_service import IntegrityService
 from app.views.main_window import MainWindow
 from pathlib import Path
 from app.services.history_storage import HistoryStorage
+from app.services.settings_storage import SettingsStorage
 
 
 def main() -> None:
@@ -18,7 +19,8 @@ def main() -> None:
     root = Path(__file__).resolve().parent
     controller = AppController(state, window, DirectoryService(),
                                IntegrityService((root / "data", root / "reports")), BaselineStorage(),
-                               HistoryStorage(root / "data" / "history.sqlite3"))
+                               HistoryStorage(root / "data" / "history.sqlite3"),
+                               settings_storage=SettingsStorage(root / "data" / "settings.json"))
     window.set_controller(controller)
     controller.start()
     window.mainloop()
