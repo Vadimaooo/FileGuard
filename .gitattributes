@@ -1,2 +1,3 @@
+* text=auto eol=lf
 # Тексти ліцензій зберігаємо без зміни перенесень рядків і пробілів авторів.
 licenses/*.txt -text -whitespace
