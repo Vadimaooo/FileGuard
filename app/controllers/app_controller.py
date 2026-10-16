@@ -14,6 +14,7 @@ from app.services.integrity_service import IntegrityService, OperationCancelled,
 from app.services.exclusions import ExclusionRules
 from app.services.history_storage import HistoryStorage
 from app.services.report_codec import report_text
+from app.services.report_service import ReportService
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,8 @@ class AppView(Protocol):
 
     def show_saved_result(self, result: CheckResult, text: str) -> None: ...
 
+    def ask_save_report(self, directory: Path, filename: str, extension: str) -> str: ...
+
 
 class AppController:
     """Обробляє команди; не створює віджетів і не обчислює хешів."""
@@ -51,6 +54,7 @@ class AppController:
         integrity_service: IntegrityService | None = None,
         baseline_storage: BaselineStorage | None = None,
         history_storage: HistoryStorage | None = None,
+        report_service: ReportService | None = None,
     ) -> None:
         self.state = state
         self.view = view
@@ -58,6 +62,7 @@ class AppController:
         self.integrity_service = integrity_service or IntegrityService()
         self.baseline_storage = baseline_storage or BaselineStorage()
         self.history_storage = history_storage
+        self.report_service = report_service or ReportService()
         self.state.history_available = history_storage is not None
         self._cancel = Event()
         self._progress_queue: Queue[ScanProgress] = Queue(maxsize=1)
@@ -207,6 +212,22 @@ class AppController:
 
         self._start_task(task, "Відкриття збереженої перевірки…", "history_open")
 
+    def export_result(self, result: CheckResult | None = None, extension: str = "txt") -> None:
+        if self.state.busy:
+            return
+        result = result or self.state.check_result
+        if result is None:
+            return
+        filename = f"FileGuard_{result.completed_at:%Y%m%d_%H%M%S}.{extension}"
+        selected = self.view.ask_save_report(self.report_service.default_directory, filename, extension)
+        if not selected:
+            return
+
+        def task():
+            return self.report_service.export(result, selected, extension, self._cancel)
+
+        self._start_task(task, "Збереження звіту…", "exported")
+
     def _report_progress(self, progress: ScanProgress) -> None:
         # Зберігаємо лише найновіше повідомлення, щоб великі папки не переповнили чергу.
         try:
@@ -285,6 +306,8 @@ class AppController:
             self.state.status_message = "Відкрито збережену перевірку · поточний еталон не змінено"
             if not self._close_requested:
                 self.view.show_saved_result(*value)
+        elif kind == "exported":
+            self.state.status_message = f"Звіт збережено: {value.name}"
         elif kind in ("created", "loaded"):
             baseline, path = value
             self.state.baseline = baseline
@@ -310,7 +333,7 @@ class AppController:
             self.view.close()
         elif kind == "error":
             titles = {"checked": "Не вдалося перевірити цілісність", "history_list": "Історія недоступна",
-                      "history_open": "Не вдалося відкрити запис історії"}
+                      "history_open": "Не вдалося відкрити запис історії", "exported": "Не вдалося зберегти звіт"}
             title = titles.get(self._task_kind, "Не вдалося опрацювати еталон")
             self.view.show_error(title, str(value))
         elif warning:

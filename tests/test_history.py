@@ -22,7 +22,7 @@ class HistoryView(TaskView):
         self.opened = (result, text)
 
 
-class HistoryTests(unittest.TestCase):
+class HistoryFixture:
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -34,6 +34,17 @@ class HistoryTests(unittest.TestCase):
         baseline = service.create_baseline(source, True, self.root / "b.json", Event(), lambda p: None)
         self.result = service.check_integrity(baseline, self.root / "b.json", Event(), lambda p: None)
         self.storage = HistoryStorage(self.root / "history.sqlite3")
+
+    def finish(self, controller, view):
+        deadline = time.monotonic() + 5
+        while controller.state.busy and time.monotonic() < deadline:
+            if view.callbacks:
+                view.callbacks.pop(0)()
+            time.sleep(0.005)
+        self.assertFalse(controller.state.busy)
+
+
+class HistoryTests(HistoryFixture, unittest.TestCase):
 
     def test_restart_restores_complete_result_with_hashes_and_counts(self):
         identifier = self.storage.save(self.result, Event())
@@ -65,14 +76,6 @@ class HistoryTests(unittest.TestCase):
             connection.execute("PRAGMA user_version=99")
         with self.assertRaises(ValueError):
             self.storage.list_entries()
-
-    def finish(self, controller, view):
-        deadline = time.monotonic() + 5
-        while controller.state.busy and time.monotonic() < deadline:
-            if view.callbacks:
-                view.callbacks.pop(0)()
-            time.sleep(0.005)
-        self.assertFalse(controller.state.busy)
 
     def test_controller_records_check_and_opens_past_result_without_changing_current_state(self):
         state = AppState(baseline=self.result.baseline)

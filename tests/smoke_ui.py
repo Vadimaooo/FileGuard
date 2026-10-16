@@ -4,6 +4,7 @@ import sys
 import tempfile
 import time
 import gc
+import csv
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -111,6 +112,12 @@ def main() -> None:
             assert state.check_result.counts[FileStatus.ADDED] == 1
             assert state.check_result.counts[FileStatus.DELETED] == 1
             assert window.counter_labels["Усього"].cget("text") == "3"
+            report = Path(temporary) / "report.csv"
+            with patch.object(window, "ask_save_report", return_value=str(report)):
+                window.export_menu.invoke(1)
+            finish_task(window, state)
+            with report.open(encoding="utf-8-sig", newline="") as stream:
+                assert len(list(csv.DictReader(stream, delimiter=";"))) == 3
             assert window.counter_labels["Змінено"].cget("text") == "1"
             assert window.counter_labels["Помилки"].cget("text") == "0"
             assert window.table_title.get() == "Результати перевірки"

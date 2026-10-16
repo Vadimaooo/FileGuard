@@ -19,7 +19,12 @@ class SavedResultWindow(tk.Toplevel):
         toolbar.pack(fill="x")
         ttk.Label(toolbar, text="Збережений результат · поточні файли повторно не читаються").pack(side="left")
         if on_export:
-            ttk.Button(toolbar, text="Зберегти звіт", command=lambda: on_export(result)).pack(side="right")
+            self.export_button = ttk.Menubutton(toolbar, text="Зберегти звіт")
+            self.export_menu = tk.Menu(self.export_button, tearoff=False)
+            for extension, label in (("txt", "Текстовий звіт (.txt)"), ("csv", "Таблиця CSV (.csv)")):
+                self.export_menu.add_command(label=label, command=lambda ext=extension: on_export(result, ext))
+            self.export_button.configure(menu=self.export_menu)
+            self.export_button.pack(side="right")
         content = tk.Text(self, wrap="word", font=("Consolas", 10), background="white", padx=14, pady=12)
         scroll = ttk.Scrollbar(self, command=content.yview)
         scroll.pack(side="right", fill="y")
@@ -41,3 +46,7 @@ class SavedResultWindow(tk.Toplevel):
         if event.widget is self and self._append_after is not None:
             self.after_cancel(self._append_after)
             self._append_after = None
+
+    def set_busy(self, busy):
+        if hasattr(self, "export_button"):
+            self.export_button.configure(state="disabled" if busy else "normal")

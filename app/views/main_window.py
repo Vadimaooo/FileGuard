@@ -250,7 +250,11 @@ class MainWindow(tk.Tk):
         self.status_filter.grid(row=0, column=1, padx=(8, 10))
         self.details_button = ttk.Button(toolbar, text="Відомості", state="disabled", command=self._show_file_details)
         self.details_button.grid(row=0, column=2, padx=(0, 8))
-        self.export_button = ttk.Button(toolbar, text="Зберегти звіт", state="disabled")
+        self.export_button = ttk.Menubutton(toolbar, text="Зберегти звіт", state="disabled")
+        self.export_menu = tk.Menu(self.export_button, tearoff=False)
+        self.export_menu.add_command(label="Текстовий звіт (.txt)", command=lambda: self._export_report("txt"))
+        self.export_menu.add_command(label="Таблиця CSV (.csv)", command=lambda: self._export_report("csv"))
+        self.export_button.configure(menu=self.export_menu)
         self.export_button.grid(row=0, column=3)
 
         table_area = ttk.Frame(results, style="Surface.TFrame")
@@ -402,7 +406,15 @@ class MainWindow(tk.Tk):
     def show_saved_result(self, result: CheckResult, text: str) -> None:
         if self._saved_result_window is not None and self._saved_result_window.winfo_exists():
             self._saved_result_window.destroy()
-        self._saved_result_window = SavedResultWindow(self, result, text)
+        self._saved_result_window = SavedResultWindow(self, result, text, self._export_saved_report)
+
+    def _export_report(self, extension):
+        if self._controller is not None:
+            self._controller.export_result(extension=extension)
+
+    def _export_saved_report(self, result, extension):
+        if self._controller is not None:
+            self._controller.export_result(result, extension)
 
     def _cancel_operation(self) -> None:
         if self._controller is not None:
@@ -438,6 +450,12 @@ class MainWindow(tk.Tk):
             parent=self, title="Завантажити еталон", initialdir=str(directory),
             filetypes=(("Еталон JSON", "*.json"), ("Усі файли", "*.*")),
         )
+
+    def ask_save_report(self, directory: Path, filename: str, extension: str) -> str:
+        label = "Текстовий звіт" if extension == "txt" else "Таблиця CSV"
+        return filedialog.asksaveasfilename(parent=self, title="Зберегти звіт", initialdir=str(directory),
+                                          initialfile=filename, defaultextension="." + extension,
+                                          filetypes=((label, "*." + extension),), confirmoverwrite=True)
 
     def schedule(self, delay_ms: int, callback: Callable[[], None]) -> None:
         self.after(delay_ms, callback)
@@ -630,6 +648,9 @@ class MainWindow(tk.Tk):
             state="normal" if state.selected_folder is not None and not state.busy else "disabled"
         )
         self.check_button.configure(state="normal" if state.baseline is not None and not state.busy else "disabled")
+        self.export_button.configure(state="normal" if state.check_result is not None and not state.busy else "disabled")
+        if self._saved_result_window is not None and self._saved_result_window.winfo_exists():
+            self._saved_result_window.set_busy(state.busy)
         self.cancel_button.configure(state="disabled" if state.cancel_requested else "normal")
         if state.busy:
             self.progress_area.grid()

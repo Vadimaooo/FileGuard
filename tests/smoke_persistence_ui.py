@@ -67,6 +67,11 @@ def main():
             window.history_open_button.invoke()
             finish_task(window, controller.state)
             assert "test.txt" in window._saved_result_window.content.get("1.0", "end")
+            report = directory / "saved_report.txt"
+            with patch.object(window, "ask_save_report", return_value=str(report)):
+                window._saved_result_window.export_menu.invoke(0)
+            finish_task(window, controller.state)
+            assert "test.txt" in report.read_text(encoding="utf-8")
         finally:
             window.destroy()
             del controller, window
