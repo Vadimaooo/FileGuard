@@ -100,7 +100,6 @@ class AppSettings:
     exclusion_patterns: tuple[str, ...] = ()
     status_filter: FileStatus | None = None
     window_size: tuple[int, int] | None = None
-    glass_enabled: bool = True
 
 
 @dataclass
@@ -114,7 +113,6 @@ class AppState:
     history_available: bool = False
     history_entries: tuple[HistoryEntry, ...] = ()
     window_size: tuple[int, int] | None = None
-    glass_enabled: bool = True
     baseline: Baseline | None = None
     baseline_path: Path | None = None
     check_result: CheckResult | None = None

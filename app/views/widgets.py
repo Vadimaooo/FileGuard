@@ -54,17 +54,16 @@ class WindowFrame(QWidget):
     """Рамка підтримує системне перетягування, зміну розміру та Alt+F4."""
     def __init__(self):
         super().__init__()
-        self.glass_active = False
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint
                             | Qt.WindowType.WindowSystemMenuHint | Qt.WindowType.WindowMinMaxButtonsHint)
+        # Прозорі лише зовнішні кути; фон усередині рамки залишається непрозорим.
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         QApplication.instance().installEventFilter(self)
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        background = QColor(244, 248, 255, 115) if self.glass_active else QColor("#eaf1fd")
-        painter.setBrush(background)
+        painter.setBrush(QColor("#eaf1fd"))
         painter.setPen(QPen(QColor(222, 231, 245, 180), 1))
         painter.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 18, 18)
 

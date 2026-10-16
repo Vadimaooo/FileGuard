@@ -33,7 +33,7 @@ class QtUiTests(unittest.TestCase):
         baseline = IntegrityService().create_baseline(source, True, self.root / "b.json", Event(), lambda p: None)
         self.window = MainWindow()
         self.addCleanup(dispose, self.window)
-        self.state = AppState(selected_folder=source, baseline=baseline, glass_enabled=False)
+        self.state = AppState(selected_folder=source, baseline=baseline)
         self.settings = SettingsStorage(self.root / "settings.json")
         self.controller = AppController(self.state, self.window, DirectoryService(), settings_storage=self.settings)
         self.window.set_controller(self.controller)
@@ -47,7 +47,6 @@ class QtUiTests(unittest.TestCase):
         finish_task(self.window, self.state)
         self.state.selected_folder = source
         self.state.baseline = baseline
-        self.state.glass_enabled = False
         self.window.render_state(self.state)
         pump()
 
@@ -96,5 +95,4 @@ class QtUiTests(unittest.TestCase):
         self.assertFalse(self.window.isVisible())
         self.assertIsNone(self.state.check_result)
         self.assertEqual(self.settings.load().last_folder, self.state.selected_folder)
-        self.assertFalse(self.settings.load().glass_enabled)
         self.assertEqual(self.errors, [])

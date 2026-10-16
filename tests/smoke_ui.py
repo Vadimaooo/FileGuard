@@ -29,7 +29,7 @@ def main():
         (source / "ignored.tmp").write_bytes(b"ignored")
         destination = directory / "baseline.json"
         window = MainWindow()
-        state = AppState(glass_enabled=False)
+        state = AppState()
         controller = AppController(state, window, DirectoryService())
         window.set_controller(controller)
         window.show()
@@ -103,13 +103,9 @@ def main():
             window.navigation[2].click()
             pump()
             assert window.save_settings_button.isVisible()
-            with patch("app.views.main_window.apply_glass", return_value=False):
-                controller.set_glass_enabled(True)
-                assert not window.glass_active
-                assert "непрозорий" in window.glass_hint.text()
         finally:
             dispose(window)
-    print("Qt UI smoke: OK (signals, baseline, comparison, filters, details, errors, CSV, 1200 rows, resizing, glass fallback)")
+    print("Qt UI smoke: OK (signals, baseline, comparison, filters, details, errors, CSV, 1200 rows, resizing)")
 
 
 if __name__ == "__main__":

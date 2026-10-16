@@ -57,7 +57,6 @@ def main():
             controller.set_include_subfolders(False)
             controller.set_exclusion_patterns(["*.tmp", "cache/"])
             controller.set_status_filter(FileStatus.CHANGED.value)
-            controller.set_glass_enabled(False)
             window.resize(1100, 850)
             window.navigation[2].click()
             window.save_settings_button.click()
@@ -71,7 +70,7 @@ def main():
             state = controller.state
             assert state.selected_folder == source
             assert state.baseline is None and state.check_result is None
-            assert not state.include_subfolders and not state.glass_enabled
+            assert not state.include_subfolders
             assert state.exclusion_patterns == ("*.tmp", "cache/")
             assert state.status_filter == FileStatus.CHANGED
             assert window.get_window_size() == (1100, 850)
@@ -92,7 +91,7 @@ def main():
             assert not window.isVisible()
         finally:
             dispose(window)
-    print("Qt persistence smoke: OK (immutable history, restart, settings, glass preference, TXT, missing source, normal close)")
+    print("Qt persistence smoke: OK (immutable history, restart, settings, TXT, missing source, normal close)")
 
 
 if __name__ == "__main__":

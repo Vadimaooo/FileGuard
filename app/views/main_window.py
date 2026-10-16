@@ -16,7 +16,6 @@ from app.views.icons import icon
 from app.views.saved_result_window import SavedResultWindow
 from app.views.table_models import ResultsModel, StatusDelegate, TONES, display_modified, display_size
 from app.views.widgets import Card, DragBar, Switch, WindowFrame, label
-from app.views.windows_effects import apply_glass
 
 
 class MainWindow(WindowFrame):
@@ -31,7 +30,6 @@ class MainWindow(WindowFrame):
         self._result = self._baseline = None
         self._saved_result_window = None
         self._detail_windows = []
-        self._glass_requested = None
         self._counts = {}
         self.setWindowTitle("FileGuard — Контроль цілісності файлів")
         self.setWindowIcon(icon("shield", "#1675ff"))
@@ -123,7 +121,7 @@ class MainWindow(WindowFrame):
         self.title_label.setText(("Контроль цілісності", "Історія перевірок", "Налаштування")[index])
         self.subtitle_label.setText(("Порівняння файлів зі збереженим еталоном",
                                      "Завершені перевірки та збережені звіти",
-                                     "Параметри нового еталона та оформлення")[index])
+                                     "Параметри нового еталона та виключення")[index])
 
     def _build_check_page(self):
         page = QWidget()
@@ -324,13 +322,6 @@ class MainWindow(WindowFrame):
         self.apply_exclusions_button = self.button("Застосувати виключення", self._apply_exclusions)
         page.box.addWidget(self.apply_exclusions_button, 0, Qt.AlignmentFlag.AlignLeft)
         page.box.addSpacing(12)
-        page.box.addWidget(label("Оформлення", "Heading"))
-        self.glass_check = Switch("Ефект матового скла")
-        self.glass_check.toggled.connect(lambda enabled: self._controller.set_glass_enabled(enabled))
-        page.box.addWidget(self.glass_check)
-        self.glass_hint = label("Якщо ефект недоступний, використовується світлий непрозорий фон.", "Muted")
-        self.glass_hint.setWordWrap(True)
-        page.box.addWidget(self.glass_hint)
         self.save_settings_button = self.button("Зберегти налаштування", lambda: self._controller.save_settings(), True)
         page.box.addWidget(self.save_settings_button, 0, Qt.AlignmentFlag.AlignLeft)
         automatic = label("Застосовані параметри також зберігаються під час закриття програми.", "Muted")
@@ -367,11 +358,6 @@ class MainWindow(WindowFrame):
                 switch.setChecked(state.include_subfolders)
         with QSignalBlocker(self.status_filter):
             self.status_filter.setCurrentText(state.status_filter.value if state.status_filter else "Усі статуси")
-        with QSignalBlocker(self.glass_check):
-            self.glass_check.setChecked(state.glass_enabled)
-        if self._glass_requested != state.glass_enabled:
-            self._glass_requested = state.glass_enabled
-            self._update_glass()
         if self._rendered_patterns != state.exclusion_patterns:
             self.exclusions_input.setPlainText("\n".join(state.exclusion_patterns))
             self._rendered_patterns = state.exclusion_patterns
@@ -407,7 +393,7 @@ class MainWindow(WindowFrame):
         self.cancel_button.setEnabled(not state.cancel_requested)
         for widget in (self.choose_button, self.load_baseline_button, self.subfolders_check,
                        self.settings_subfolders_check, self.apply_exclusions_button, self.exclusions_input,
-                       self.save_settings_button, self.glass_check, self.issues_button):
+                       self.save_settings_button, self.issues_button):
             widget.setEnabled(not state.busy)
         self.create_baseline_button.setEnabled(not state.busy and state.selected_folder is not None)
         self.check_button.setEnabled(not state.busy and state.baseline is not None)
@@ -434,19 +420,6 @@ class MainWindow(WindowFrame):
         if self._saved_result_window:
             self._saved_result_window.set_busy(state.busy)
         self.footer.setText(state.status_message)
-
-    def _update_glass(self):
-        if not self.isVisible():
-            return
-        self.glass_active = apply_glass(int(self.winId()), bool(self._glass_requested))
-        self.glass_hint.setText("Ефект скла увімкнено. Читабельність вмісту збережено." if self.glass_active else
-                                "Використовується світлий непрозорий фон." if not self._glass_requested else
-                                "Система використовує світлий непрозорий фон замість ефекту скла.")
-        self.update()
-
-    def showEvent(self, event):
-        super().showEvent(event)
-        QTimer.singleShot(0, self, self._update_glass)
 
     def _apply_exclusions(self):
         self._controller.set_exclusion_patterns(tuple(line.strip() for line in self.exclusions_input.toPlainText().splitlines() if line.strip()))
